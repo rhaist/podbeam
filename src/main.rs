@@ -840,6 +840,11 @@ impl Converter {
     fn packet(&mut self, input: &[f32], backlog_ms: f64, target_ms: f64) -> Res<Vec<i16>> {
         use rubato::audioadapter_buffers::direct::InterleavedSlice;
         use rubato::{Adjustable, Resampler};
+        let inp = InterleavedSlice::new(input, 2, input.len() / 2)?;
+        let mut out = InterleavedSlice::new_mut(&mut self.out, 2, FRAMES)?;
+        self.sinc.process_into_buffer(&inp, &mut out, None)?;
+        // Only now steer the ratio: it sets how many frames the *next* packet needs, so changing it
+        // before processing would make `input` (sized by `needed()`) one frame short.
         // Smooth over capture bursts (time constant ~0.4 s), then play up to 0.1 % faster or slower:
         // a few ms of excess backlog drain at up to 1 ms per second.
         self.backlog_ms = if self.backlog_ms.is_nan() {
@@ -849,9 +854,6 @@ impl Converter {
         };
         let rel = 1.0 - (3e-4 * (self.backlog_ms - target_ms)).clamp(-1e-3, 1e-3);
         self.sinc.set_resample_ratio_relative(rel, true)?;
-        let inp = InterleavedSlice::new(input, 2, input.len() / 2)?;
-        let mut out = InterleavedSlice::new_mut(&mut self.out, 2, FRAMES)?;
-        self.sinc.process_into_buffer(&inp, &mut out, None)?;
         if self.out.iter().all(|&s| s == 0.0) {
             return Ok(vec![0; FRAMES * 2]); // digital silence stays silent, no dither hiss
         }
@@ -1445,6 +1447,26 @@ mod tests {
             worst < 2.0,
             "backlog still up to {worst:.1} ms off target in the last 20 s"
         );
+    }
+
+    /// Regression: the drift correction changed the ratio inside `packet()`, after `needed()` had
+    /// been asked, so the resampler sometimes wanted one frame more than it was given and the
+    /// session died with "Insufficient input buffer size 382, expected 383 frames".
+    #[test]
+    fn converter_needed_matches_what_packet_takes() {
+        let mut conv = Converter::new(48_000).unwrap();
+        let mut noise = 0x9e37_79b9_7f4a_7c15u64;
+        for packet in 0..5000 {
+            // Backlog jumps around like real bursty capture, so the ratio changes on every packet.
+            noise ^= noise << 13;
+            noise ^= noise >> 7;
+            noise ^= noise << 17;
+            let backlog = 15.0 + (noise % 2000) as f64 / 100.0 - 10.0;
+            let n = conv.needed();
+            if let Err(e) = conv.packet(&vec![0.1; n * 2], backlog, 15.0) {
+                panic!("packet {packet}: {e}");
+            }
+        }
     }
 
     #[test]
