@@ -375,7 +375,9 @@ fn srp_client(user: &str, pin: &str, salt: &[u8], b_pub: &[u8], a_priv: &[u8]) -
     let (n, g) = srp_group();
     let num = |h: [u8; 64]| BigUint::from_bytes_be(&h);
     let b = BigUint::from_bytes_be(b_pub);
-    if &b % &n == BigUint::ZERO {
+    // RFC 5054 only demands B % N != 0, but anything outside 1..N is bogus and would also overflow
+    // the 384-byte padding below; a real receiver never sends it.
+    if b == BigUint::ZERO || b >= n {
         return Err("SRP: receiver sent an invalid public key".into());
     }
     let a = BigUint::from_bytes_be(a_priv);
@@ -986,6 +988,23 @@ impl Drop for EndSession {
     }
 }
 
+/// One packet's worth of 16-bit samples from the capture queue: the send loop's per-packet step,
+/// kept separate so tests run exactly this against simulated capture.
+fn next_samples(pcm: &Pcm, cushion: &mut Cushion, conv: &mut Converter) -> Res<Vec<i16>> {
+    let (input, backlog) = {
+        let mut q = pcm.lock().unwrap();
+        let input = cushion.take(&mut q, conv.needed());
+        (input, q.len() as f64 / cushion.per_ms as f64)
+    };
+    Ok(match input {
+        Some(input) => conv.packet(&input, backlog, cushion.ms as f64)?,
+        None => {
+            conv.reset();
+            vec![0; FRAMES * 2]
+        }
+    })
+}
+
 /// `latency` is in samples: how far behind real time the HomePod plays.
 fn stream_to(
     addr: SocketAddr,
@@ -1175,18 +1194,7 @@ fn stream_to(
             ctrl.send_to(&sync, ctrl_to)?;
         }
 
-        let (input, backlog) = {
-            let mut q = pcm.lock().unwrap();
-            let input = cushion.take(&mut q, conv.needed());
-            (input, q.len() as f64 / cushion.per_ms as f64)
-        };
-        let samples = match input {
-            Some(input) => conv.packet(&input, backlog, cushion.ms as f64)?,
-            None => {
-                conv.reset();
-                vec![0; FRAMES * 2]
-            }
-        };
+        let samples = next_samples(&pcm, &mut cushion, &mut conv)?;
         let pkt = audio_packet(&aead, sent == 0, seq, rtp, ssrc, &alac(&samples));
         audio.send_to(&pkt, audio_to)?;
         history.lock().unwrap()[seq as usize % HISTORY] = pkt;
@@ -1216,6 +1224,9 @@ fn stream_to(
         .take()
         .map_or(Ok(()), |e| Err(e.into()))
 }
+
+#[cfg(test)]
+mod fake_homepod;
 
 #[cfg(test)]
 mod tests {
@@ -1469,6 +1480,165 @@ mod tests {
         }
     }
 
+    /// The send loop's per-packet step against simulated capture for two minutes: a 48 kHz card
+    /// running 150 ppm fast that delivers 10 ms blocks with scheduling jitter, a 2 s pause in
+    /// playback, and a 1 s stall (PC busy) whose audio then arrives in one lump. Nothing may fail,
+    /// steady playback must not drop out, and the backlog must settle back near its target.
+    #[test]
+    fn send_step_survives_realistic_capture() {
+        const RATE_IN: f64 = 48_000.0 * (1.0 + 150e-6);
+        let pcm = Pcm::default();
+        let (mut cushion, mut conv) = (Cushion::new(48_000), Converter::new(48_000).unwrap());
+        let (mut noise, mut owed, mut phase) = (0x2545_f491_4f6c_dd1du64, 0.0f64, 0u64);
+        let mut deliver = |q: &mut VecDeque<f32>, ms: f64| {
+            owed += RATE_IN * ms / 1000.0;
+            for _ in 0..owed as usize {
+                let v =
+                    (0.3 * (std::f64::consts::TAU * 440.0 * phase as f64 / 48_000.0).sin()) as f32;
+                q.extend([v, v]);
+                phase += 1;
+            }
+            owed -= owed.floor();
+        };
+        let packet_ms = FRAMES as f64 * 1000.0 / RATE as f64;
+        let (mut next_capture, mut next_packet, mut silent_in_steady, mut worst_backlog) =
+            (0.0, 0.0, 0, 0f64);
+        let mut t = 0.0;
+        while t < 120_000.0 {
+            let paused = (40_000.0..42_000.0).contains(&t);
+            let stalled = (80_000.0..81_000.0).contains(&t);
+            if t >= next_capture && !paused && !stalled {
+                // A 10 ms block, except every so often the thread wakes late and hands over 20-30 ms.
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                let late = if noise % 20 == 0 {
+                    10.0 + (noise % 3) as f64 * 5.0
+                } else {
+                    0.0
+                };
+                let since = if t == 0.0 { 10.0 } else { 10.0 + late };
+                deliver(&mut pcm.lock().unwrap(), since);
+                next_capture = t + 10.0 + late;
+            }
+            if (81_000.0..81_001.0).contains(&t) {
+                deliver(&mut pcm.lock().unwrap(), 1000.0); // the stalled second arrives at once
+            }
+            if t >= next_packet {
+                let samples = next_samples(&pcm, &mut cushion, &mut conv)
+                    .unwrap_or_else(|e| panic!("at {:.0} ms: {e}", t));
+                assert_eq!(samples.len(), FRAMES * 2);
+                let steady = t > 10_000.0
+                    && !(39_000.0..50_000.0).contains(&t)
+                    && !(79_000.0..95_000.0).contains(&t);
+                if steady {
+                    silent_in_steady += samples.iter().all(|&s| s == 0) as u32;
+                    let backlog = pcm.lock().unwrap().len() as f64 / cushion.per_ms as f64;
+                    worst_backlog = worst_backlog.max((backlog - cushion.ms as f64).abs());
+                }
+                next_packet += packet_ms;
+            }
+            t += 0.25;
+        }
+        assert_eq!(silent_in_steady, 0, "dropouts during steady playback");
+        assert!(
+            worst_backlog < 25.0,
+            "backlog strayed {worst_backlog:.1} ms from its target"
+        );
+    }
+
+    /// Everything a receiver (or anyone spoofing one on the LAN) sends goes through these parsers.
+    /// Thousands of random and mangled inputs may only produce clean errors or results: no panic,
+    /// no oversized allocation, no hang.
+    #[test]
+    fn network_parsers_survive_garbage() {
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mangle = |good: &[u8], rnd: &mut dyn FnMut() -> u64| -> Vec<u8> {
+            let mut v = good.to_vec();
+            match rnd() % 4 {
+                0 => v.truncate(rnd() as usize % (v.len() + 1)), // cut short
+                1 => (0..1 + rnd() % 8).for_each(|_| {
+                    let i = rnd() as usize % v.len().max(1);
+                    if let Some(b) = v.get_mut(i) {
+                        *b ^= 1 << (rnd() % 8);
+                    }
+                }), // flip bits
+                2 => v.extend((0..rnd() % 64).map(|_| rnd() as u8)), // trailing junk
+                _ => v = (0..rnd() % 600).map(|_| rnd() as u8).collect(), // pure noise
+            }
+            v
+        };
+
+        let reply = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 5\r\nServer: x\r\n\r\nhello";
+        let mut setup = Vec::new();
+        plist::to_writer_binary(
+            &mut setup,
+            &Value::Dictionary(dict([
+                ("eventPort", int(7001u16)),
+                (
+                    "streams",
+                    Value::Array(vec![Value::Dictionary(dict([("dataPort", int(6000u16))]))]),
+                ),
+            ])),
+        )
+        .unwrap();
+        let pairing = tlv(&[(6, &[2]), (2, &[9; 16]), (3, &[7; 384])]);
+        for _ in 0..20_000 {
+            // RTSP replies, including absurd Content-Length and endless header lines.
+            let mut msg = mangle(reply, &mut rnd);
+            if rnd() % 50 == 0 {
+                msg = [
+                    &b"RTSP/1.0 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n"[..],
+                    &msg,
+                ]
+                .concat();
+            }
+            if rnd() % 50 == 0 {
+                msg = vec![b'A'; 100_000];
+            }
+            let _ = read_msg(&mut &msg[..]);
+            // Pairing TLVs and SETUP plists.
+            let t = mangle(&pairing, &mut rnd);
+            for typ in [2, 3, 4, 6, 7] {
+                assert!(tlv_get(&t, typ).len() <= t.len());
+            }
+            let _ = plist::from_bytes::<Value>(&mangle(&setup, &mut rnd));
+        }
+
+        // Encrypted channel: forged or corrupted frames must be rejected, never decrypted or panic.
+        let key: [u8; 32] = random();
+        let good = Cipher::new(key).seal(b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+        for _ in 0..200 {
+            let wire = mangle(&good, &mut rnd);
+            let mut rd = Decrypting::new(serve_once(wire.clone()), Some(Cipher::new(key)));
+            // Junk after an intact frame is fine to ignore; anything that damages the frame is not.
+            if !wire.starts_with(&good) {
+                assert!(read_msg(&mut rd).is_err(), "a corrupted frame was accepted");
+            }
+        }
+
+        // SRP with malformed salts and public keys from the receiver.
+        for _ in 0..30 {
+            let salt = (0..rnd() % 40).map(|_| rnd() as u8).collect::<Vec<_>>();
+            let b = match rnd() % 3 {
+                0 => vec![0; rnd() as usize % 400], // zero: must be refused
+                1 => srp_group().0.to_bytes_be(),   // N itself: must be refused
+                _ => (0..rnd() % 500).map(|_| rnd() as u8).collect(), // any length, any value
+            };
+            let r = srp_client("Pair-Setup", "3939", &salt, &b, &random::<32>());
+            let bn = BigUint::from_bytes_be(&b);
+            if bn == BigUint::ZERO || bn >= srp_group().0 {
+                assert!(r.is_err(), "SRP accepted a public key outside 1..N");
+            }
+        }
+    }
+
     #[test]
     fn dither_keeps_detail_below_one_bit() {
         let mut conv = Converter::new(RATE).unwrap();
@@ -1646,6 +1816,130 @@ mod tests {
         assert!(
             read_msg(&mut &b"RTSP/1.0 200 OK\r\nContent-Length: 99999999999\r\n\r\n"[..]).is_err()
         );
+    }
+
+    /// Stream a 1 kHz tone to the fake HomePod for 2.5 s, then stop. Everything podbeam does on the
+    /// wire must work end to end: pairing, encrypted session and event channel, volume, audio that
+    /// decrypts and decodes back to the tone without gaps, sync packets, and TEARDOWN on stop.
+    #[test]
+    fn end_to_end_against_fake_homepod() {
+        use fake_homepod::Mode;
+        let (addr, report) = fake_homepod::start(Mode::Normal);
+        let (pcm, ctl) = (Pcm::default(), Arc::<Ctl>::default());
+        // "Capture": a 48 kHz, 1 kHz tone in 10 ms blocks, like a sound card would deliver it.
+        let (feed, c) = (pcm.clone(), ctl.clone());
+        std::thread::spawn(move || {
+            // Paced by an absolute schedule like a real sound card clock; sleeping 10 ms per block
+            // would run a little slow, beyond what the drift correction is meant to absorb.
+            let (start, mut i) = (Instant::now(), 0u64);
+            while !c.stopped() {
+                let block: Vec<f32> = (i..i + 480)
+                    .flat_map(|k| {
+                        [(0.3 * (std::f64::consts::TAU * 1000.0 * k as f64 / 48_000.0).sin())
+                            as f32; 2]
+                    })
+                    .collect();
+                feed.lock().unwrap().extend(block);
+                i += 480;
+                let due = start + Duration::from_micros(i * 1_000_000 / 48_000);
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            }
+        });
+        let c = ctl.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            c.stop.store(true, Relaxed);
+        });
+        stream_to(addr, pcm, 48_000, 80 * RATE / 1000, &ctl).expect("streaming to the fake failed");
+        std::thread::sleep(Duration::from_millis(700)); // let the fake finish collecting audio
+
+        let r = report.lock().unwrap();
+        let methods: Vec<&str> = r.requests.iter().map(String::as_str).collect();
+        let expected = [
+            "POST /pair-setup",
+            "POST /pair-setup",
+            "SETUP rtsp://",
+            "RECORD rtsp://",
+            "SETUP rtsp://",
+            "SET_PARAMETER rtsp://",
+        ];
+        assert!(
+            methods.len() > expected.len()
+                && expected
+                    .iter()
+                    .zip(&methods)
+                    .all(|(want, got)| got.starts_with(want)),
+            "request order: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m.starts_with("POST /feedback")),
+            "no keep-alive: {methods:?}"
+        );
+        assert!(
+            methods.last().unwrap().starts_with("TEARDOWN"),
+            "no TEARDOWN on stop: {methods:?}"
+        );
+        assert!(
+            r.event_answered,
+            "podbeam did not acknowledge the pushed event"
+        );
+        assert!(
+            !r.volumes.is_empty() && r.volumes.iter().all(|v| (-144.0..=0.0).contains(v)),
+            "volumes: {:?}",
+            r.volumes
+        );
+        assert!(r.syncs >= 2, "only {} sync packets", r.syncs);
+        assert_eq!(r.seq_gaps, 0, "audio packets missing");
+
+        // The tone must come back at 1 kHz and the level it was captured at (0.3 of full scale).
+        let tone: Vec<f64> = r
+            .left
+            .iter()
+            .skip_while(|&&s| s == 0)
+            .skip(4410)
+            .map(|&s| s as f64 / 32767.0)
+            .collect();
+        let seconds = tone.len() as f64 / RATE as f64;
+        assert!(seconds > 1.0, "only {seconds:.2} s of tone arrived");
+        let crossings = tone
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count() as f64;
+        assert!(
+            (crossings / seconds - 1000.0).abs() < 3.0,
+            "tone arrived at {:.1} Hz",
+            crossings / seconds
+        );
+        let peak = tone.iter().fold(0f64, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - 0.3).abs() < 0.01,
+            "tone arrived with peak {peak:.3}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_error_paths() {
+        use fake_homepod::Mode;
+        let run = |mode| {
+            let (addr, _report) = fake_homepod::start(mode);
+            let pcm = Pcm::default();
+            pcm.lock()
+                .unwrap()
+                .extend(std::iter::repeat_n(0.0, 48_000 * 2));
+            stream_to(addr, pcm, 48_000, 80 * RATE / 1000, &Arc::default())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            run(Mode::RefusePairing).contains("pair-setup error"),
+            "refused pairing"
+        );
+        assert!(
+            run(Mode::WrongProof).contains("proof mismatch"),
+            "impostor's proof accepted"
+        );
+        let e = run(Mode::HangUp);
+        assert!(e.contains("lost the HomePod"), "hang-up reported as: {e}");
     }
 
     fn serve_once(bytes: Vec<u8>) -> TcpStream {
