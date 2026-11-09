@@ -22,6 +22,10 @@ type Pcm = Arc<Mutex<VecDeque<f32>>>; // interleaved stereo at the capture devic
 const RATE: u32 = 44100;
 const FRAMES: usize = 352; // frames per RTP packet ("spf")
 const HISTORY: usize = 512; // sent packets kept for retransmission (~4 s)
+/// The HomePod's buffer in ms: where a session starts (the latency setting) and the rungs it grows
+/// through when the network stalls. A HomePod plays nothing below 80 ms. The tray menu offers these.
+const LADDER_MS: [u32; 4] = [80, 120, 200, 400];
+const MAX_LATENCY_MS: u32 = 2000; // what SETUP allows the buffer to grow to
 
 #[cfg(any(windows, target_os = "linux"))]
 mod tray;
@@ -54,8 +58,25 @@ fn run() -> Res<()> {
         (_, Ok(ip)) => (ip, 7000).into(),
         _ => find(&target, &discover()?)?,
     };
-    let _speakers_off = VirtualSink::new(latency_ms);
-    play(addr, latency_ms, &Arc::default())
+    let mut speakers_off = VirtualSink::new(latency_ms);
+    let ctl = Arc::<Ctl>::default();
+    std::thread::scope(|s| {
+        // Keep the delay reported to video players in step with the buffer as it grows.
+        s.spawn(|| {
+            let mut shown = latency_ms;
+            while !ctl.stopped() {
+                std::thread::sleep(Duration::from_millis(500));
+                let ms = ctl.latency_ms.load(Relaxed);
+                if let Some(sink) = speakers_off.as_mut().filter(|_| ms > shown) {
+                    sink.set_latency(ms);
+                    shown = ms;
+                }
+            }
+        });
+        let result = play(addr, latency_ms, &ctl);
+        ctl.stop.store(true, Relaxed); // also when play failed before streaming began
+        result
+    })
 }
 
 /// Every message podbeam prints goes through here, with a UTC timestamp. On the command line that is
@@ -118,6 +139,7 @@ struct Ctl {
     stop: AtomicBool,
     status: Mutex<String>,
     error: Mutex<Option<String>>,
+    latency_ms: AtomicU32, // the HomePod's buffer; grows when the network stalls
 }
 
 impl Ctl {
@@ -142,7 +164,7 @@ fn play(addr: SocketAddr, latency_ms: u32, ctl: &Arc<Ctl>) -> Res<()> {
     let pcm = Pcm::default();
     let (stream, rate) = capture(pcm.clone())?;
     stream.play()?;
-    stream_to(addr, pcm, rate, latency_ms * RATE / 1000, ctl)
+    stream_to(addr, pcm, rate, latency_ms, ctl)
 }
 
 /// Browse `_raop._tcp` for 3 s and return every receiver found, sorted by name.
@@ -730,6 +752,133 @@ fn int(n: impl Into<u64>) -> Value {
     Value::Integer(n.into().into())
 }
 
+/// The buffer to grow to after a ping to the HomePod took `rtt_ms`, if `current_ms` does not cover
+/// it with 20 ms to spare: the next rung that does, or the top one.
+fn grow_latency(current_ms: u32, rtt_ms: u32) -> Option<u32> {
+    if rtt_ms + 20 <= current_ms {
+        return None;
+    }
+    let top = LADDER_MS[LADDER_MS.len() - 1];
+    LADDER_MS
+        .into_iter()
+        .find(|&r| r > current_ms && r >= rtt_ms + 20)
+        .or((current_ms < top).then_some(top))
+}
+
+/// Ping the HomePod 20 times a second and grow its buffer when a reply takes longer than the
+/// buffer covers. Wi-Fi scans and busy access points hold packets up for 100-300 ms now and then;
+/// an audio packet held up past the buffer is lost to the speaker (it crackles, nothing is resent).
+fn watch_network(ip: IpAddr, ctl: Arc<Ctl>) {
+    let Some(mut ping) = pinger(ip) else {
+        return log("cannot ping the speaker; its buffer stays fixed");
+    };
+    let mut answered = false;
+    for tries in 0.. {
+        if ctl.stopped() {
+            return;
+        }
+        let rtt = ping(Duration::from_secs(1));
+        // A missing reply counts as a stall only once the speaker has answered: some networks
+        // drop pings altogether.
+        let ms = match rtt {
+            Some(t) => t.as_millis() as u32,
+            None if answered => 1000,
+            None if tries < 20 => continue,
+            None => return log("the speaker does not answer pings; its buffer stays fixed"),
+        };
+        answered = true;
+        let current = ctl.latency_ms.load(Relaxed);
+        if let Some(next) = grow_latency(current, ms) {
+            ctl.latency_ms.store(next, Relaxed);
+            log(format!(
+                "buffer {current} -> {next} ms: the network stalled for {ms} ms"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+type Pinger = Box<dyn FnMut(Duration) -> Option<Duration> + Send>;
+
+/// An ICMP echo to `ip`, timed; None on timeout. Linux allows unprivileged ping sockets (systemd's
+/// default `ping_group_range`); where it does not, there is no pinger.
+#[cfg(target_os = "linux")]
+fn pinger(ip: IpAddr) -> Option<Pinger> {
+    use std::os::fd::FromRawFd;
+    let IpAddr::V4(ip) = ip else { return None };
+    // SAFETY: a fresh socket; UdpSocket takes ownership of the descriptor.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+    if fd < 0 {
+        return None;
+    }
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    sock.connect((ip, 0)).ok()?;
+    let mut seq = 0u16;
+    Some(Box::new(move |timeout| {
+        seq = seq.wrapping_add(1);
+        let [hi, lo] = seq.to_be_bytes();
+        sock.set_read_timeout(Some(timeout)).ok()?;
+        let start = Instant::now();
+        sock.send(&[8, 0, 0, 0, 0, 0, hi, lo]).ok()?; // echo request; the kernel sets id and checksum
+        let mut b = [0u8; 64];
+        loop {
+            let n = sock.recv(&mut b).ok()?;
+            if n >= 8 && b[0] == 0 && b[6..8] == [hi, lo] {
+                return Some(start.elapsed());
+            }
+        }
+    }))
+}
+
+#[cfg(windows)]
+fn pinger(ip: IpAddr) -> Option<Pinger> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    };
+    struct Icmp(HANDLE);
+    // SAFETY: an ICMP handle may be used from any thread.
+    unsafe impl Send for Icmp {}
+    impl Icmp {
+        fn handle(&self) -> HANDLE {
+            self.0 // a method, so the closure captures the Send wrapper, not the bare handle
+        }
+    }
+    impl Drop for Icmp {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from IcmpCreateFile and is closed once.
+            let _ = unsafe { IcmpCloseHandle(self.0) };
+        }
+    }
+    let IpAddr::V4(ip) = ip else { return None };
+    // SAFETY: plain Win32 call; the handle is closed by Icmp's drop.
+    let icmp = Icmp(unsafe { IcmpCreateFile() }.ok()?);
+    let to = u32::from_ne_bytes(ip.octets());
+    Some(Box::new(move |timeout| {
+        let mut reply = [0u8; std::mem::size_of::<ICMP_ECHO_REPLY>() + 16];
+        let start = Instant::now();
+        // SAFETY: request and reply buffers are valid for the sizes given.
+        let n = unsafe {
+            IcmpSendEcho(
+                icmp.handle(),
+                to,
+                b"podbeam".as_ptr().cast(),
+                7,
+                None,
+                reply.as_mut_ptr().cast(),
+                reply.len() as u32,
+                timeout.as_millis() as u32,
+            )
+        };
+        (n > 0).then(|| start.elapsed())
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn pinger(_ip: IpAddr) -> Option<Pinger> {
+    None
+}
+
 /// Answer the receiver's clock-sync requests: echo its send time, add our receive/send times.
 fn serve_timing(sock: UdpSocket, ctl: Arc<Ctl>) {
     let mut b = [0u8; 128];
@@ -1190,14 +1339,16 @@ fn next_samples(pcm: &Pcm, cushion: &mut Cushion, conv: &mut Converter) -> Res<V
     })
 }
 
-/// `latency` is in samples: how far behind real time the HomePod plays.
+/// `latency_ms`: how far behind real time the HomePod starts playing; it grows when the network
+/// stalls (`watch_network`).
 fn stream_to(
     addr: SocketAddr,
     pcm: Pcm,
     capture_rate: u32,
-    latency: u32,
+    latency_ms: u32,
     ctl: &Arc<Ctl>,
 ) -> Res<()> {
+    ctl.latency_ms.store(latency_ms.max(LADDER_MS[0]), Relaxed);
     let mut end = EndSession {
         ctl: ctl.clone(),
         events: None,
@@ -1277,9 +1428,10 @@ fn stream_to(
             ("audioMode", Value::String("default".into())),
             ("spf", int(FRAMES as u64)),
             ("sr", int(RATE)),
-            // The HomePod buffers up to latencyMax; pin both ends to what we want.
-            ("latencyMin", int(latency)),
-            ("latencyMax", int(latency)),
+            // The HomePod plays latencyMin after the time in the sync packets, which can move it
+            // later while streaming, up to latencyMax. With min = max it goes silent when moved.
+            ("latencyMin", int(LADDER_MS[0] * RATE / 1000)),
+            ("latencyMax", int(MAX_LATENCY_MS * RATE / 1000)),
             ("shk", Value::Data(shk.to_vec())),
             ("controlPort", int(ctrl.local_addr()?.port())),
             ("isMedia", Value::Boolean(true)),
@@ -1303,8 +1455,10 @@ fn stream_to(
 
     ctl.say(format!(
         "streaming to {addr} with {} ms latency",
-        latency * 1000 / RATE
+        ctl.latency_ms.load(Relaxed)
     ));
+    let (ip, c) = (addr.ip(), ctl.clone());
+    std::thread::spawn(move || watch_network(ip, c));
 
     // Keep-alive and volume in their own thread so a slow reply never delays audio; the HomePod ends
     // the session without the keep-alive.
@@ -1382,15 +1536,17 @@ fn stream_to(
             std::thread::sleep(wait);
         }
         if sent % 125 == 0 {
-            // About once a second: "frame rtp is due at NTP now"; the first one carries the extension
-            // bit. Not rtp-latency, the AirPlay 1 convention: the HomePod adds the SETUP latency
-            // itself, so that counted it twice. Measured mic-to-speaker at 80 ms: 206 ms before,
-            // 125 ms after; at 200 ms: 448 and 245 ms.
+            // About once a second: "frame rtp-extra is due at NTP now", both RTP fields shifted
+            // alike (the first sync carries the extension bit). The HomePod plays latencyMin after
+            // that, so the buffer is latencyMin + extra, and raising extra grows it without a gap.
+            // Measured mic-to-speaker: 80 ms setting 125 ms; grown to 200 ms 242 ms.
+            let extra = (ctl.latency_ms.load(Relaxed) - LADDER_MS[0]) * RATE / 1000;
+            let at = rtp.wrapping_sub(extra).to_be_bytes();
             let sync = [
                 &[if sent == 0 { 0x90 } else { 0x80 }, 0xd4, 0x00, 0x07][..],
-                &rtp.to_be_bytes(),
+                &at,
                 &ntp_now(),
-                &rtp.to_be_bytes(),
+                &at,
             ]
             .concat();
             ctrl.send_to(&sync, ctrl_to)?;
@@ -1544,6 +1700,20 @@ mod tests {
             (430.0..450.0).contains(&hz),
             "captured {hz:.1} Hz, expected 440"
         );
+    }
+
+    /// Grow to the next rung that covers a stall with 20 ms to spare; never past the top rung, never
+    /// for a ping the buffer already covers.
+    #[test]
+    fn buffer_grows_to_cover_stalls() {
+        assert_eq!(grow_latency(80, 5), None);
+        assert_eq!(grow_latency(80, 60), None);
+        assert_eq!(grow_latency(80, 61), Some(120));
+        assert_eq!(grow_latency(80, 150), Some(200));
+        assert_eq!(grow_latency(120, 285), Some(400));
+        assert_eq!(grow_latency(200, 1700), Some(400)); // a 1.7 s stall still stops at the top
+        assert_eq!(grow_latency(400, 1700), None);
+        assert_eq!(grow_latency(150, 140), Some(200)); // a command-line value between rungs
     }
 
     #[test]
@@ -2102,7 +2272,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2500));
             c.stop.store(true, Relaxed);
         });
-        stream_to(addr, pcm, 48_000, 80 * RATE / 1000, &ctl).expect("streaming to the fake failed");
+        stream_to(addr, pcm, 48_000, 80, &ctl).expect("streaming to the fake failed");
         std::thread::sleep(Duration::from_millis(700)); // let the fake finish collecting audio
 
         let r = report.lock().unwrap();
@@ -2141,6 +2311,18 @@ mod tests {
             r.volumes
         );
         assert!(r.syncs >= 2, "only {} sync packets", r.syncs);
+        // Buffer room to grow into (min = max goes silent when the sync time moves), and a fast
+        // local network gives no reason to grow: both sync fields are the plain packet time.
+        assert_eq!(
+            r.latency,
+            (80 * 441 / 10, 2000 * 441 / 10),
+            "SETUP latencyMin/Max"
+        );
+        assert!(
+            r.sync_rtp.iter().all(|&(a, b)| a == b),
+            "sync fields differ: {:?}",
+            r.sync_rtp
+        );
         assert_eq!(r.seq_gaps, 0, "audio packets missing");
         // A nonce built from the 16-bit seq leaves bytes 2.. zero and repeats after 9 minutes.
         let distinct: std::collections::HashSet<_> = r.nonces.iter().collect();
@@ -2186,7 +2368,7 @@ mod tests {
             pcm.lock()
                 .unwrap()
                 .extend(std::iter::repeat_n(0.0, 48_000 * 2));
-            stream_to(addr, pcm, 48_000, 80 * RATE / 1000, &Arc::default())
+            stream_to(addr, pcm, 48_000, 80, &Arc::default())
                 .unwrap_err()
                 .to_string()
         };
@@ -2218,7 +2400,7 @@ mod tests {
             *s.lock().unwrap() = Some(Instant::now());
             c.stop.store(true, Relaxed);
         });
-        stream_to(addr, Pcm::default(), 48_000, 80 * RATE / 1000, &ctl).unwrap();
+        stream_to(addr, Pcm::default(), 48_000, 80, &ctl).unwrap();
         let took = stop_at.lock().unwrap().expect("never streamed").elapsed();
         assert!(took < Duration::from_secs(3), "stop took {took:?}");
     }

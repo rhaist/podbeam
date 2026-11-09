@@ -24,13 +24,15 @@ pub enum Mode {
 
 #[derive(Default)]
 pub struct Report {
-    pub requests: Vec<String>, // first line of every RTSP request, in order
-    pub volumes: Vec<f32>,     // every "volume:" value set
-    pub left: Vec<i16>,        // decoded left channel of every audio packet, in sequence order
-    pub seq_gaps: u32,         // audio packets missing between first and last
-    pub nonces: Vec<[u8; 8]>,  // nonce trailer of every audio packet, in arrival order
-    pub syncs: u32,            // sync packets on the control port
-    pub event_answered: bool,  // podbeam acknowledged the event we pushed
+    pub requests: Vec<String>,     // first line of every RTSP request, in order
+    pub volumes: Vec<f32>,         // every "volume:" value set
+    pub left: Vec<i16>,            // decoded left channel of every audio packet, in sequence order
+    pub seq_gaps: u32,             // audio packets missing between first and last
+    pub nonces: Vec<[u8; 8]>,      // nonce trailer of every audio packet, in arrival order
+    pub syncs: u32,                // sync packets on the control port
+    pub sync_rtp: Vec<(u32, u32)>, // the two RTP fields of every sync packet
+    pub latency: (u64, u64),       // latencyMin and latencyMax from the stream SETUP
+    pub event_answered: bool,      // podbeam acknowledged the event we pushed
 }
 
 /// Start the fake on 127.0.0.1; returns its address and the report it fills while podbeam talks to it.
@@ -232,6 +234,8 @@ fn serve(mut tcp: TcpStream, mode: Mode, report: Arc<Mutex<Report>>) -> Res<()> 
                         .as_dictionary()
                         .unwrap();
                     shk = Some(<[u8; 32]>::try_from(s["shk"].as_data().unwrap()).unwrap());
+                    let samples = |k: &str| s[k].as_unsigned_integer().unwrap();
+                    report.lock().unwrap().latency = (samples("latencyMin"), samples("latencyMax"));
                     let ports = dict([
                         ("type", int(96u8)),
                         ("dataPort", int(data.local_addr()?.port())),
@@ -308,7 +312,12 @@ fn collect_audio(data: UdpSocket, ctrl: UdpSocket, shk: [u8; 32], report: &Mutex
             .nonces
             .push(pkt[len - 8..].try_into().unwrap());
         while let Ok(n) = ctrl.recv(&mut b) {
-            report.lock().unwrap().syncs += (n == 20 && b[1] == 0xd4) as u32;
+            if n == 20 && b[1] == 0xd4 {
+                let field = |at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+                let mut r = report.lock().unwrap();
+                r.syncs += 1;
+                r.sync_rtp.push((field(4), field(16)));
+            }
         }
     }
     let mut r = report.lock().unwrap();

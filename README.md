@@ -12,9 +12,10 @@ Tested with HomePods from Windows 11 and from Debian with PipeWire 1.6.
 ## Features
 
 - No PIN, no pairing step: podbeam uses the guest access HomePods offer on your network.
-- About 125 ms from the PC to the speaker (measured). On Linux with PipeWire, video players
-  are told this delay and keep the picture in sync, and only the HomePod plays: the PC's
-  speakers go quiet while streaming and come back afterwards.
+- About 125 ms from the PC to the speaker (measured). When the Wi-Fi stalls, podbeam grows
+  the speaker's buffer on the fly (up to 400 ms) instead of crackling on; the menu shows it.
+- On Linux with PipeWire, video players are told the delay and keep the picture in sync,
+  and only the HomePod plays: the PC's speakers go quiet while streaming.
 - The volume and mute keys control the speaker.
 - Encrypted end to end; lost packets are resent; resampling and dither are clean to the
   16-bit limit.
@@ -52,12 +53,13 @@ a `.desktop` file with `Exec=podbeam` in `~/.config/autostart`.
 ```
 podbeam "Living Room"         # first device whose name contains this text
 podbeam 192.168.1.50          # by address, skips discovery
-podbeam "Living Room" 120     # with 120 ms latency (80 to 2000)
+podbeam "Living Room" 200     # start with a 200 ms buffer (80 to 2000)
 ```
 
 When something happened, podbeam prints a line every 10 s, e.g. `last 10 s: 3 packets
-resent (network loss), 0 capture dropouts, capture buffer 20 ms`. Many resends mean weak
-Wi-Fi: raise the latency.
+resent (network loss), 0 capture dropouts, capture buffer 20 ms`, and one when the buffer
+grows, e.g. `buffer 80 -> 200 ms: the network stalled for 113 ms`. If the first stall of
+every session bothers you, start with a bigger buffer.
 
 **Log:** the tray writes everything to `%LOCALAPPDATA%\podbeam\podbeam.log` (Windows) or
 `~/.local/state/podbeam/podbeam.log` (Linux). Attach it when you report a problem.

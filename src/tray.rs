@@ -16,7 +16,7 @@ pub use linux::run;
 #[cfg(windows)]
 pub use windows::run;
 
-const LATENCIES: [u32; 4] = [80, 120, 200, 400]; // a HomePod plays nothing below 80 ms
+const LATENCIES: [u32; 4] = LADDER_MS; // the buffer grows through these by itself too
 
 /// A menu click.
 #[derive(Clone, Copy)]
@@ -149,6 +149,17 @@ impl App {
         // A session that ended on its own (HomePod lost): give the PC its speakers back.
         if !self.session.as_ref().is_some_and(Session::running) {
             self.speakers_off = None;
+        }
+        // The buffer grew on a stalling network: show it, report it to video players, and start
+        // the next session there (in memory only).
+        if let Some(s) = self.session.as_ref().filter(|s| s.running()) {
+            let ms = s.ctl.latency_ms.load(Relaxed);
+            if ms > self.latency_ms {
+                self.latency_ms = ms;
+                if let Some(sink) = &mut self.speakers_off {
+                    sink.set_latency(ms);
+                }
+            }
         }
     }
 

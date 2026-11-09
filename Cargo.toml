@@ -31,7 +31,7 @@ ksni = { version = "0.3.7", default-features = false, features = ["blocking", "a
 
 [target."cfg(windows)".dependencies]
 tray-icon = { version = "0.26.1", default-features = false } # GTK backend is Linux-only and unused
-windows = { version = "0.62", features = ["Win32_Media_Audio_Endpoints", "Win32_System_Com"] } # system volume
+windows = { version = "0.62", features = ["Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_Foundation", "Win32_NetworkManagement_IpHelper"] } # system volume, ping
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Foundation"] }
 
 [profile.release]
