@@ -42,8 +42,9 @@ fn run() -> Res<()> {
         .next()
         .map_or(Ok(80), |v| v.parse())
         .ok()
-        .filter(|ms| (20..=2000).contains(ms))
-        .ok_or("latency must be 20..2000 ms")?;
+        // Below 80 ms a HomePod accepts the stream but plays nothing (measured: silent at 40 and 60).
+        .filter(|ms| (80..=2000).contains(ms))
+        .ok_or("latency must be 80..2000 ms")?;
     #[cfg(any(windows, target_os = "linux"))]
     if target.is_empty() {
         return tray::run(latency_ms);
@@ -1347,10 +1348,13 @@ fn stream_to(
             std::thread::sleep(wait);
         }
         if sent % 125 == 0 {
-            // About once a second: "frame rtp-latency is playing at NTP now"; the first one carries the extension bit.
+            // About once a second: "frame rtp is due at NTP now"; the first one carries the extension
+            // bit. Not rtp-latency, the AirPlay 1 convention: the HomePod adds the SETUP latency
+            // itself, so that counted it twice. Measured mic-to-speaker at 80 ms: 206 ms before,
+            // 125 ms after; at 200 ms: 448 and 245 ms.
             let sync = [
                 &[if sent == 0 { 0x90 } else { 0x80 }, 0xd4, 0x00, 0x07][..],
-                &rtp.wrapping_sub(latency).to_be_bytes(),
+                &rtp.to_be_bytes(),
                 &ntp_now(),
                 &rtp.to_be_bytes(),
             ]

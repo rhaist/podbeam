@@ -16,7 +16,7 @@ pub use linux::run;
 #[cfg(windows)]
 pub use windows::run;
 
-const LATENCIES: [u32; 6] = [40, 60, 80, 120, 200, 400];
+const LATENCIES: [u32; 4] = [80, 120, 200, 400]; // a HomePod plays nothing below 80 ms
 
 /// A menu click.
 #[derive(Clone, Copy)]

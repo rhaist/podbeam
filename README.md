@@ -21,8 +21,10 @@ PipeWire 1.6. Linux audio capture is also tested against PulseAudio in CI.
 - Everything on the wire is encrypted: control channel, event channel and audio.
 - Transparent conversion: high-quality sinc resampling with clock-drift correction and
   TPDF dither, measured at the 16-bit limit (87 dB) across the audio band.
-- Low latency: 80 ms speaker buffer by default (adjustable from 40 to 400 ms), plus a
-  small capture buffer that sizes itself to your PC.
+- Low latency: about 125 ms from the PC to the speaker (measured with a microphone next
+  to a HomePod), from an 80 ms speaker buffer, the lowest a HomePod accepts, plus a small
+  capture buffer that sizes itself to your PC. A higher latency setting (up to 400 ms in
+  the menu) adds its value on top and helps on weak Wi-Fi.
 - Resends lost packets when the speaker asks for them.
 - Follows your system volume: the keyboard's volume and mute keys (or the volume slider)
   control the speaker.
