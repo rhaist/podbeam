@@ -26,7 +26,7 @@ jobs:
       - run: rustup update stable && rustup component add clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - name: Capture from a real PulseAudio monitor
+      - name: Capture and volume against a real PulseAudio server
         run: |
           pulseaudio -D --exit-idle-time=-1
           pactl load-module module-null-sink sink_name=ci
@@ -34,4 +34,4 @@ jobs:
           sox -q -n -t raw -r 48000 -e signed -b 16 -c 2 - synth 30 sine 440 \
             | pacat --device=ci --format=s16le --rate=48000 --channels=2 &
           sleep 1
-          cargo test --locked -- --ignored pulse_monitor_capture
+          cargo test --locked -- --ignored --test-threads=1 pulse_monitor_capture pulse_system_volume

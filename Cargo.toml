@@ -23,9 +23,12 @@ sha2 = "0.11.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { version = "0.18", features = ["pulseaudio"] } # PulseAudio/PipeWire monitor capture
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+pulseaudio = "0.3" # default sink volume, for the volume keys
 
 [target."cfg(windows)".dependencies]
 tray-icon = { version = "0.26.1", default-features = false } # GTK backend is Linux-only and unused
+windows = { version = "0.62", features = ["Win32_Media_Audio_Endpoints", "Win32_System_Com"] } # system volume
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Foundation"] }
 
 [profile.release]

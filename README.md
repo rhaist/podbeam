@@ -22,6 +22,8 @@ against PulseAudio in CI; streaming from Linux to a real HomePod is not tested y
 - Low latency: 80 ms speaker buffer by default (adjustable from 40 to 400 ms), plus a
   small capture buffer that sizes itself to your PC.
 - Resends lost packets when the speaker asks for them.
+- Follows your system volume: the keyboard's volume and mute keys (or the volume slider)
+  control the speaker.
 
 ## Install
 
@@ -106,7 +108,9 @@ handled automatically by growing the capture buffer.
 
 - One speaker at a time; no multi-room or stereo pairs.
 - No tray icon on Linux yet; use the command line.
-- No volume control yet; streams start at about a third of full volume.
+- The speaker follows the system volume, so your PC's own speakers change with it, and
+  muting the PC mutes the speaker too. Where the system volume cannot be read, podbeam
+  starts at about a third of full volume.
 - Only AirPlay 2 receivers that support transient pairing (HomePods). AirPlay 1-only
   receivers are not supported.
 - Linear-interpolation resampling: fine for a speaker, not audiophile grade.
