@@ -8,8 +8,8 @@ installer and no background service.
 > podbeam is an independent project. It is not affiliated with, endorsed by or supported
 > by Apple. AirPlay and HomePod are trademarks of Apple Inc.
 
-Tested with a HomePod (2nd generation) on Windows 11. Linux audio capture is tested
-against PulseAudio in CI; streaming from Linux to a real HomePod is not tested yet.
+Tested with a HomePod (2nd generation) on Windows 11, and with a HomePod on Debian with
+PipeWire 1.6. Linux audio capture is also tested against PulseAudio in CI.
 
 ## Features
 

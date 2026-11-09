@@ -183,7 +183,11 @@ fn capture(pcm: Pcm) -> Res<(cpal::Stream, u32)> {
         .find(|d| d.id().is_ok_and(|id| id.id() == monitor))
         .ok_or(format!("no monitor source '{monitor}'"))?;
     // The server converts to whatever format we ask for, so always take f32 at the source's rate.
-    loopback::<f32>(&dev, dev.default_input_config()?.config(), pcm)
+    // Ask for 10 ms fragments: the server default (pipewire-pulse: 2 s, capped to its quantum, ~136 ms
+    // here) delivers bursts bigger than the Cushion can absorb, so the queue runs dry on every burst.
+    let mut cfg = dev.default_input_config()?.config();
+    cfg.buffer_size = cpal::BufferSize::Fixed(cfg.sample_rate / 100);
+    loopback::<f32>(&dev, cfg, pcm)
 }
 
 /// WASAPI loopback: an input stream opened on the default *output* device captures what Windows plays.
@@ -341,6 +345,8 @@ impl Read for Decrypting {
     }
 }
 
+// Not a secret: the public 3072-bit prime of RFC 5054 (appendix A) that every HomeKit SRP client
+// and accessory uses. SRP's security comes from the random private values, never from N.
 const N_3072: &str = "
     FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD
     EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED
@@ -564,6 +570,9 @@ impl Rtsp {
         if !tlv_get(&m2, 7).is_empty() {
             return Err(format!("pair-setup error {:?}; set AirPlay access to 'Everyone on this network' in the Home app", tlv_get(&m2, 7)).into());
         }
+        // Not a leaked credential: transient pairing uses the same public username and PIN for every
+        // client (it is the speaker's guest access, see "Security notes" in the README). The session
+        // key comes from the random private value below and is never stored.
         let srp = srp_client(
             "Pair-Setup",
             "3939",
@@ -579,6 +588,8 @@ impl Rtsp {
             )
             .into());
         }
+        // The salt/info strings are public labels from the HAP specification, not keys: they only
+        // tell HKDF which key to derive from the secret SRP session key.
         self.out = Some(Cipher::new(hkdf(
             &srp.key,
             "Control-Salt",
@@ -646,24 +657,25 @@ fn alac(samples: &[i16]) -> Vec<u8> {
 }
 
 /// RTP packet with ChaCha20-Poly1305 payload: header | ciphertext | tag | 8-byte nonce; AAD = timestamp+SSRC.
+/// `nonce` must never repeat under one key. It is not `seq`: that 16-bit counter wraps after 9 minutes.
 fn audio_packet(
     aead: &ChaCha20Poly1305,
     first: bool,
     seq: u16,
     rtp: u32,
     ssrc: u32,
+    nonce: u64,
     payload: &[u8],
 ) -> Vec<u8> {
     let mut pkt = vec![0x80, if first { 0xe0 } else { 0x60 }];
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&rtp.to_be_bytes());
     pkt.extend_from_slice(&ssrc.to_be_bytes());
-    let mut nonce = [0u8; 12];
-    nonce[4..6].copy_from_slice(&seq.to_le_bytes());
+    let nonce = chacha_nonce(nonce);
     let aad: [u8; 8] = pkt[4..12].try_into().unwrap();
     pkt.extend(
         aead.encrypt(
-            &nonce.into(),
+            &nonce,
             Payload {
                 msg: payload,
                 aad: &aad,
@@ -1079,7 +1091,10 @@ fn stream_to(
 
     r.ok("RECORD", "", "", None)?;
 
-    let shk: [u8; 32] = key[..32].try_into()?; // audio key, the same choice OwnTone makes
+    // The audio key, the same choice OwnTone makes. Sending it in SETUP is how AirPlay 2 works and
+    // safe: that request travels over the control channel, which is already encrypted. Like every
+    // key here it exists only in memory, for this one session.
+    let shk: [u8; 32] = key[..32].try_into()?;
     let stream = r.setup(dict([(
         "streams",
         Value::Array(vec![Value::Dictionary(dict([
@@ -1168,10 +1183,11 @@ fn stream_to(
         std::thread::spawn(move || serve_resends(ctrl, audio, audio_to, history, resent, c));
     }
 
-    let (mut seq, mut rtp, ssrc) = (
+    let (mut seq, mut rtp, ssrc, nonce0) = (
         u16::from_be_bytes(random()),
         u32::from_be_bytes(random()),
         u32::from_be_bytes(random()),
+        u64::from_be_bytes(random()),
     );
     let start = Instant::now();
     let (mut sent, mut last_stats) = (0u64, Instant::now());
@@ -1195,7 +1211,15 @@ fn stream_to(
         }
 
         let samples = next_samples(&pcm, &mut cushion, &mut conv)?;
-        let pkt = audio_packet(&aead, sent == 0, seq, rtp, ssrc, &alac(&samples));
+        let pkt = audio_packet(
+            &aead,
+            sent == 0,
+            seq,
+            rtp,
+            ssrc,
+            nonce0.wrapping_add(sent),
+            &alac(&samples),
+        );
         audio.send_to(&pkt, audio_to)?;
         history.lock().unwrap()[seq as usize % HISTORY] = pkt;
         (seq, rtp, sent) = (
@@ -1231,6 +1255,16 @@ mod fake_homepod;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
+
+    /// The end-to-end test streams in real time and takes this alone; tests that keep a core busy for
+    /// seconds take it shared. Otherwise they starve it on small CI runners and the tone it checks
+    /// comes back with gaps. A failed test poisons the lock; the others carry on regardless.
+    static REALTIME: RwLock<()> = RwLock::new(());
+
+    fn cpu_heavy() -> std::sync::RwLockReadGuard<'static, ()> {
+        REALTIME.read().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn alac_frame_layout() {
@@ -1285,8 +1319,23 @@ mod tests {
         let pcm = Pcm::default();
         let (stream, rate) = capture(pcm.clone()).unwrap();
         stream.play().unwrap();
-        std::thread::sleep(Duration::from_secs(2));
+        // Audio must arrive in small chunks: one bigger than the Cushion's maximum drains it dry on
+        // every chunk (pipewire-pulse's default delivered ~136 ms). Ignore the start-up quarter second.
+        let (start, mut seen, mut biggest) = (Instant::now(), 0, 0);
+        while start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+            let len = pcm.lock().unwrap().len();
+            if start.elapsed() > Duration::from_millis(250) {
+                biggest = biggest.max(len - seen);
+            }
+            seen = len;
+        }
         drop(stream);
+        let chunk_ms = biggest as f64 / 2.0 / (rate as f64 / 1000.0);
+        assert!(
+            chunk_ms < 50.0,
+            "capture arrives in {chunk_ms:.0} ms chunks"
+        );
         let q: Vec<f32> = pcm.lock().unwrap().iter().copied().collect();
         let left: Vec<f32> = q
             .iter()
@@ -1438,6 +1487,7 @@ mod tests {
     /// must pull it to the target and hold it there, without ever running dry.
     #[test]
     fn converter_tracks_clock_drift() {
+        let _cpu = cpu_heavy();
         let (rate, drift, per_ms, target) = (48_000.0, 1.0 + 300e-6, 96.0, 15.0);
         let mut conv = Converter::new(48_000).unwrap();
         let mut queued = (target + 10.0) * per_ms; // samples waiting, as a float to keep fractions
@@ -1465,6 +1515,7 @@ mod tests {
     /// session died with "Insufficient input buffer size 382, expected 383 frames".
     #[test]
     fn converter_needed_matches_what_packet_takes() {
+        let _cpu = cpu_heavy();
         let mut conv = Converter::new(48_000).unwrap();
         let mut noise = 0x9e37_79b9_7f4a_7c15u64;
         for packet in 0..5000 {
@@ -1486,6 +1537,7 @@ mod tests {
     /// steady playback must not drop out, and the backlog must settle back near its target.
     #[test]
     fn send_step_survives_realistic_capture() {
+        let _cpu = cpu_heavy();
         const RATE_IN: f64 = 48_000.0 * (1.0 + 150e-6);
         let pcm = Pcm::default();
         let (mut cushion, mut conv) = (Cushion::new(48_000), Converter::new(48_000).unwrap());
@@ -1552,7 +1604,8 @@ mod tests {
     /// no oversized allocation, no hang.
     #[test]
     fn network_parsers_survive_garbage() {
-        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let _cpu = cpu_heavy();
+        let mut state = 0x853c_49e6_748f_ea9bu64; // fixed PRNG seed so failures reproduce; not a key
         let mut rnd = move || {
             state ^= state << 13;
             state ^= state >> 7;
@@ -1768,6 +1821,7 @@ mod tests {
     }
 
     /// Vector produced by srptools (the SRP library pyatv pairs HomePods with), so a shared mistake can't hide.
+    /// The hex values are test inputs and expected outputs, not keys of any real device or session.
     #[test]
     fn srp_matches_srptools() {
         let h = |s: &str| {
@@ -1823,6 +1877,7 @@ mod tests {
     /// decrypts and decodes back to the tone without gaps, sync packets, and TEARDOWN on stop.
     #[test]
     fn end_to_end_against_fake_homepod() {
+        let _alone = REALTIME.write().unwrap_or_else(|e| e.into_inner());
         use fake_homepod::Mode;
         let (addr, report) = fake_homepod::start(Mode::Normal);
         let (pcm, ctl) = (Pcm::default(), Arc::<Ctl>::default());
@@ -1847,6 +1902,11 @@ mod tests {
         });
         let c = ctl.clone();
         std::thread::spawn(move || {
+            // Count from the start of streaming, not of pairing: the SRP math is slow in debug builds
+            // and would leave too little streaming time for the 2 s keep-alive.
+            while !c.status.lock().unwrap().starts_with("streaming") && !c.stopped() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             std::thread::sleep(Duration::from_millis(2500));
             c.stop.store(true, Relaxed);
         });
@@ -1890,6 +1950,13 @@ mod tests {
         );
         assert!(r.syncs >= 2, "only {} sync packets", r.syncs);
         assert_eq!(r.seq_gaps, 0, "audio packets missing");
+        // A nonce built from the 16-bit seq leaves bytes 2.. zero and repeats after 9 minutes.
+        let distinct: std::collections::HashSet<_> = r.nonces.iter().collect();
+        assert_eq!(distinct.len(), r.nonces.len(), "audio nonce repeated");
+        assert!(
+            r.nonces.iter().any(|n| n[2..] != [0; 6]),
+            "audio nonce is only 16 bits"
+        );
 
         // The tone must come back at 1 kHz and the level it was captured at (0.3 of full scale).
         let tone: Vec<f64> = r
@@ -1973,10 +2040,13 @@ mod tests {
     #[test]
     fn audio_packet_layout() {
         let aead = ChaCha20Poly1305::new(&random::<32>().into());
-        let pkt = audio_packet(&aead, true, 0x1234, 7, 9, b"hello");
+        let pkt = audio_packet(&aead, true, 0x1234, 7, 9, 0x0807_0605_0403_0201, b"hello");
         assert_eq!(&pkt[..4], &[0x80, 0xe0, 0x12, 0x34]);
         assert_eq!(pkt.len(), 12 + 5 + 16 + 8);
-        assert_eq!(&pkt[pkt.len() - 8..], &[0x34, 0x12, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&pkt[pkt.len() - 8..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // The 16-bit seq repeats after 65,536 packets (9 minutes); the nonce under the same key must not.
+        let later = audio_packet(&aead, false, 0x1234, 7, 9, 0x0807_0605_0404_0201, b"hello");
+        assert_ne!(&later[later.len() - 8..], &pkt[pkt.len() - 8..]);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&pkt[pkt.len() - 8..]);
         let plain = aead

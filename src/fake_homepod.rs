@@ -1,6 +1,8 @@
 //! A fake AirPlay 2 receiver for end-to-end tests: the receiver side of transient pairing, the
 //! encrypted RTSP and event channels, and an audio socket that decrypts and decodes what podbeam
 //! sends. It runs the real `stream_to` against something that behaves like a HomePod, without one.
+//! It knows the transient PIN and decrypts the audio because a real receiver does too; every key it
+//! uses is random per test run.
 
 use super::*;
 use std::net::TcpListener;
@@ -24,6 +26,7 @@ pub struct Report {
     pub volumes: Vec<f32>,     // every "volume:" value set
     pub left: Vec<i16>,        // decoded left channel of every audio packet, in sequence order
     pub seq_gaps: u32,         // audio packets missing between first and last
+    pub nonces: Vec<[u8; 8]>,  // nonce trailer of every audio packet, in arrival order
     pub syncs: u32,            // sync packets on the control port
     pub event_answered: bool,  // podbeam acknowledged the event we pushed
 }
@@ -293,6 +296,11 @@ fn collect_audio(data: UdpSocket, ctrl: UdpSocket, shk: [u8; 32], report: &Mutex
             )
             .expect("audio packet failed authentication");
         packets.push((u16::from_be_bytes([pkt[2], pkt[3]]), alac_decode(&plain)));
+        report
+            .lock()
+            .unwrap()
+            .nonces
+            .push(pkt[len - 8..].try_into().unwrap());
         while let Ok(n) = ctrl.recv(&mut b) {
             report.lock().unwrap().syncs += (n == 20 && b[1] == 0xd4) as u32;
         }
