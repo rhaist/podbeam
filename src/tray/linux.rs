@@ -214,7 +214,11 @@ fn run_tray(latency_ms: u32, from_terminal: bool) -> Res<()> {
             if let Some(app) = &mut t.app {
                 app.poll();
             }
-            if t.quit { t.app.take() } else { None }
+            if t.quit || INTERRUPTED.load(Relaxed) {
+                t.app.take()
+            } else {
+                None
+            }
         });
         match quitting {
             None => return Err("the tray service stopped".into()),

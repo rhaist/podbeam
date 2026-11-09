@@ -1311,6 +1311,7 @@ dependencies = [
  "getrandom",
  "hkdf",
  "ksni",
+ "libc",
  "mdns-sd",
  "num-bigint",
  "plist",

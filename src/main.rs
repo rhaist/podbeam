@@ -34,6 +34,8 @@ fn main() {
 }
 
 fn run() -> Res<()> {
+    #[cfg(target_os = "linux")]
+    stop_on_signals();
     let mut args = std::env::args().skip(1);
     let target = args.next().unwrap_or_default();
     let latency_ms: u32 = args
@@ -51,6 +53,7 @@ fn run() -> Res<()> {
         (_, Ok(ip)) => (ip, 7000).into(),
         _ => find(&target, &discover()?)?,
     };
+    let _speakers_off = VirtualSink::new();
     play(addr, latency_ms, &Arc::default())
 }
 
@@ -84,6 +87,30 @@ fn utc(t: SystemTime) -> String {
     )
 }
 
+/// Set by Ctrl-C or SIGTERM on Linux: every session stops, sends TEARDOWN and gives the PC its
+/// speakers back. Without it, the default output would stay on podbeam's virtual one.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+fn stop_on_signals() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        if INTERRUPTED.swap(true, Relaxed) {
+            unsafe { libc::_exit(130) } // a second Ctrl-C: quit now
+        }
+    }
+    // SAFETY: the handler only touches an atomic and calls _exit, both async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+}
+
 /// Shared between a streaming session and whoever started it (the command line or the tray).
 #[derive(Default)]
 struct Ctl {
@@ -105,7 +132,7 @@ impl Ctl {
     }
 
     fn stopped(&self) -> bool {
-        self.stop.load(Relaxed)
+        self.stop.load(Relaxed) || INTERRUPTED.load(Relaxed)
     }
 }
 
@@ -964,6 +991,117 @@ impl SystemVolume {
         } else {
             loudest as f32 / pulseaudio::protocol::Volume::NORM.as_u32() as f32
         })
+    }
+}
+
+/// While it exists, apps play into a virtual "podbeam" output instead of the PC's speakers: only
+/// the HomePod plays, and the volume keys act on that output, which the HomePod follows. Needs
+/// PipeWire (`pw-cli`, `wpctl`); elsewhere the PC's speakers keep playing too.
+#[cfg(target_os = "linux")]
+struct VirtualSink {
+    pw: std::process::Child, // owns the output: it disappears when pw-cli exits
+    previous: std::ffi::CString, // the default output to restore
+}
+
+#[cfg(target_os = "linux")]
+impl VirtualSink {
+    fn new() -> Option<Self> {
+        Self::create()
+            .inspect_err(|e| log(format!("the PC's speakers keep playing too ({e})")))
+            .ok()
+    }
+
+    fn create() -> Res<Self> {
+        use futures::executor::block_on as block;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let pulse = pulseaudio::Client::from_env(c"podbeam")?;
+        let previous = block(pulse.server_info())?
+            .default_sink_name
+            .ok_or("no default output")?;
+        if previous.as_bytes() == b"podbeam" {
+            return Err("podbeam's output is already the default".into());
+        }
+        let old = block(pulse.sink_info_by_name(previous.clone()))?;
+        let level = old
+            .cvolume
+            .channels()
+            .iter()
+            .map(|v| v.as_u32())
+            .max()
+            .unwrap_or(0) as f32
+            / pulseaudio::protocol::Volume::NORM.as_u32() as f32;
+
+        let mut pw = Command::new("pw-cli");
+        pw.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: prctl is async-signal-safe. If podbeam dies, even by SIGKILL, pw-cli is killed
+        // and the output disappears with it. (The signal follows the spawning *thread*, which is
+        // the main thread on the command line and the tray's long-lived D-Bus thread.)
+        unsafe {
+            pw.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        let mut sink = VirtualSink {
+            pw: pw.spawn().map_err(|e| format!("pw-cli: {e}"))?,
+            previous,
+        };
+        writeln!(
+            sink.pw.stdin.as_mut().ok_or("pw-cli stdin")?,
+            "create-node adapter {{ factory.name=support.null-audio-sink node.name=podbeam \
+             node.description=\"podbeam (AirPlay)\" media.class=Audio/Sink audio.position=[FL FR] }}"
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while block(pulse.lookup_sink_by_name(c"podbeam".into())).is_err() {
+            if Instant::now() > deadline {
+                return Err("the virtual output did not appear".into()); // drop removes it
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        block(pulse.set_default_sink(c"podbeam".into()))?;
+        // A new output starts at full volume: carry the old one's over, or the HomePod starts loud.
+        // wpctl takes only ids, so wait until its default is ours before setting it.
+        let wpctl = |args: &[&str]| Command::new("wpctl").args(args).output();
+        while !String::from_utf8_lossy(&wpctl(&["inspect", "@DEFAULT_AUDIO_SINK@"])?.stdout)
+            .contains("node.name = \"podbeam\"")
+        {
+            if Instant::now() > deadline {
+                return Err("the virtual output did not become the default".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wpctl(&["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{level:.3}")])?;
+        wpctl(&[
+            "set-mute",
+            "@DEFAULT_AUDIO_SINK@",
+            if old.muted { "1" } else { "0" },
+        ])?;
+        Ok(sink)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VirtualSink {
+    fn drop(&mut self) {
+        // Default first, so apps move straight back to the speakers, not to whatever is left.
+        if let Ok(pulse) = pulseaudio::Client::from_env(c"podbeam") {
+            let _ = futures::executor::block_on(pulse.set_default_sink(self.previous.clone()));
+        }
+        let _ = self.pw.kill();
+        let _ = self.pw.wait();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct VirtualSink;
+
+#[cfg(not(target_os = "linux"))]
+impl VirtualSink {
+    fn new() -> Option<Self> {
+        None
     }
 }
 

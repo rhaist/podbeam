@@ -26,6 +26,7 @@ sha2 = "0.11.1"
 cpal = { version = "0.18", features = ["pulseaudio"] } # PulseAudio/PipeWire monitor capture
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 pulseaudio = "0.3" # default sink volume, for the volume keys
+libc = "0.2" # signals, and tying pw-cli's life to ours; already in the tree via alsa
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] } # tray icon over D-Bus, no GTK
 
 [target."cfg(windows)".dependencies]

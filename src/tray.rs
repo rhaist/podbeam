@@ -111,6 +111,7 @@ struct App {
     searching: bool,
     session: Option<Session>,
     stopping: Option<JoinHandle<()>>, // a stopped session still sending its TEARDOWN
+    speakers_off: Option<VirtualSink>, // kept across a device or latency switch
     found_tx: mpsc::Sender<Vec<(String, SocketAddr)>>,
     found: mpsc::Receiver<Vec<(String, SocketAddr)>>,
     log_path: Option<PathBuf>,
@@ -125,6 +126,7 @@ impl App {
             searching: false,
             session: None,
             stopping: None,
+            speakers_off: None,
             found_tx,
             found,
             log_path,
@@ -143,6 +145,10 @@ impl App {
     fn poll(&mut self) {
         if let Ok(list) = self.found.try_recv() {
             (self.devices, self.searching) = (list, false);
+        }
+        // A session that ended on its own (HomePod lost): give the PC its speakers back.
+        if !self.session.as_ref().is_some_and(Session::running) {
+            self.speakers_off = None;
         }
     }
 
@@ -170,6 +176,9 @@ impl App {
                 .take()
                 .map(Session::stop)
                 .or(app.stopping.take());
+            if app.speakers_off.is_none() {
+                app.speakers_off = VirtualSink::new(); // before the session picks its capture device
+            }
             app.session = Some(Session::start(addr, name, ms, previous));
         };
         match action {
@@ -195,6 +204,7 @@ impl App {
                 if let Some(s) = self.session.take() {
                     self.stopping = Some(s.stop());
                 }
+                self.speakers_off = None;
             }
             Action::OpenLog => {
                 // Opens the file with whatever the user has set for .log files.
@@ -216,6 +226,7 @@ impl App {
         for t in threads.into_iter().flatten() {
             let _ = t.join();
         }
+        self.speakers_off = None;
     }
 }
 

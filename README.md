@@ -125,9 +125,12 @@ handled automatically by growing the capture buffer.
 ## Limitations
 
 - One speaker at a time; no multi-room or stereo pairs.
-- The speaker follows the system volume, so your PC's own speakers change with it, and
-  muting the PC mutes the speaker too. Where the system volume cannot be read, podbeam
-  starts at about a third of full volume.
+- On Windows, and on Linux without PipeWire, the PC's own speakers keep playing while
+  podbeam streams. With PipeWire, podbeam adds a virtual output "podbeam (AirPlay)" for as
+  long as it streams and makes it the default, so only the HomePod plays; it puts your
+  speakers back when streaming stops, even if podbeam is killed.
+- The speaker follows the system volume, and muting the PC mutes the speaker too. Where
+  the system volume cannot be read, podbeam starts at about a third of full volume.
 - Only AirPlay 2 receivers that support transient pairing (HomePods). AirPlay 1-only
   receivers are not supported.
 - AirPlay carries 16-bit/44.1 kHz (CD quality) from third-party senders, and the HomePod
