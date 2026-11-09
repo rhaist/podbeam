@@ -19,6 +19,7 @@ hkdf = "0.13.0"
 mdns-sd = "0.21"
 num-bigint = "0.5.1"
 plist = "1.10.3"
+rubato = { version = "5.0.1", default-features = false } # sinc only; the FFT resamplers are unused
 sha2 = "0.11.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -34,3 +35,7 @@ windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "W
 [profile.release]
 lto = "thin"
 strip = true
+
+# The resampler does real DSP work; keep it fast in debug builds and tests too.
+[profile.dev.package.rubato]
+opt-level = 3
