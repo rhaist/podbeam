@@ -18,6 +18,7 @@ const LATENCIES: [u32; 6] = [40, 60, 80, 120, 200, 400];
 
 struct Session {
     addr: SocketAddr,
+    name: String, // as discovered, for the menu header
     ctl: Arc<Ctl>,
     thread: JoinHandle<()>,
 }
@@ -25,7 +26,12 @@ struct Session {
 impl Session {
     /// The new session first waits for `previous` (a stopping session's thread) to send its
     /// TEARDOWN, so the HomePod never sees two sessions; waiting here keeps the menu responsive.
-    fn start(addr: SocketAddr, latency_ms: u32, previous: Option<JoinHandle<()>>) -> Self {
+    fn start(
+        addr: SocketAddr,
+        name: String,
+        latency_ms: u32,
+        previous: Option<JoinHandle<()>>,
+    ) -> Self {
         let ctl = Arc::<Ctl>::default();
         let c = ctl.clone();
         let thread = std::thread::spawn(move || {
@@ -36,11 +42,33 @@ impl Session {
                 c.say(format!("error: {e}"));
             }
         });
-        Session { addr, ctl, thread }
+        Session {
+            addr,
+            name,
+            ctl,
+            thread,
+        }
     }
 
     fn running(&self) -> bool {
         !self.thread.is_finished()
+    }
+
+    /// One short line for the menu header and tooltip. The full messages, statistics included, are
+    /// in the log ("Open log").
+    fn headline(&self) -> String {
+        let status = self.ctl.status.lock().unwrap().clone();
+        if let Some(e) = status.strip_prefix("error: ") {
+            let short: String = e.chars().take(60).collect();
+            let more = if short.len() < e.len() { "…" } else { "" };
+            format!("Error: {short}{more}")
+        } else if !self.running() {
+            "Not streaming".into()
+        } else if status.starts_with("streaming") {
+            format!("Streaming to {}", self.name)
+        } else {
+            format!("Connecting to {}…", self.name)
+        }
     }
 
     /// Ask the session to end without waiting for it. The returned thread finishes once TEARDOWN
@@ -177,21 +205,26 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let id = ev.id.0.as_str();
             // At most one of the two is set: Stop moves the session to `stopping`, start takes it.
-            let mut restart = |s: Option<Session>, addr: SocketAddr, ms| {
+            let mut restart = |s: Option<Session>, addr: SocketAddr, name: String, ms| {
                 let previous = s.map(Session::stop).or_else(|| stopping.take());
-                Some(Session::start(addr, ms, previous))
+                Some(Session::start(addr, name, ms, previous))
             };
             if let Some(i) = id
                 .strip_prefix("dev:")
                 .and_then(|i| i.parse::<usize>().ok())
                 .filter(|&i| i < devices.len())
             {
-                session = restart(session.take(), devices[i].1, latency_ms);
+                let (name, addr) = devices[i].clone();
+                session = restart(session.take(), addr, name, latency_ms);
             } else if let Some(ms) = id.strip_prefix("lat:").and_then(|m| m.parse().ok()) {
                 latency_ms = ms;
                 // The HomePod's latency is fixed per session, so a change means reconnecting.
-                if let Some(addr) = session.as_ref().filter(|s| s.running()).map(|s| s.addr) {
-                    session = restart(session.take(), addr, ms);
+                if let Some((addr, name)) = session
+                    .as_ref()
+                    .filter(|s| s.running())
+                    .map(|s| (s.addr, s.name.clone()))
+                {
+                    session = restart(session.take(), addr, name, ms);
                 }
             } else if id == "log" {
                 // Explorer opens the file with whatever the user has set for .log files.
@@ -218,10 +251,9 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
         }
 
         let running = session.as_ref().is_some_and(Session::running);
-        let status = match &session {
-            Some(s) => s.ctl.status.lock().unwrap().clone(),
-            None => "Not streaming".into(),
-        };
+        let status = session
+            .as_ref()
+            .map_or("Not streaming".into(), Session::headline);
         let current = session.as_ref().filter(|_| running).map(|s| s.addr);
         let state = (status.clone(), running, current, latency_ms);
         if dirty || shown.as_ref() != Some(&state) {

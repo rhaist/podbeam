@@ -1238,7 +1238,11 @@ fn stream_to(
                 std::mem::take(&mut cushion.glitches),
             );
             if rs + gl > 0 || cushion.ms != shown_ms {
-                ctl.say(format!("last 10 s: {rs} packets resent (network loss), {gl} capture dropouts, capture buffer {} ms", cushion.ms));
+                // Log only: the tray's header keeps showing the short state, not the statistics.
+                log(format!(
+                    "last 10 s: {rs} packets resent (network loss), {gl} capture dropouts, capture buffer {} ms",
+                    cushion.ms
+                ));
                 shown_ms = cushion.ms;
             }
             last_stats = Instant::now();
