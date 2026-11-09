@@ -1,11 +1,15 @@
 //! Windows tray icon: pick an AirPlay device and a latency from the menu; streaming runs in a background thread.
 
 use super::*;
+use std::os::windows::io::IntoRawHandle;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
-use windows_sys::Win32::System::Console::FreeConsole;
+use windows_sys::Win32::System::Console::{
+    FreeConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, SetTimer, TranslateMessage,
 };
@@ -62,6 +66,7 @@ fn menu(
     current: Option<SocketAddr>,
     latency_ms: u32,
     status: &str,
+    has_log: bool,
 ) -> Res<Menu> {
     let m = Menu::new();
     m.append(&MenuItem::new(status, false, None))?;
@@ -105,12 +110,38 @@ fn menu(
     }
     m.append(&lat)?;
     m.append(&MenuItem::with_id("stop", "Stop", current.is_some(), None))?;
+    m.append(&MenuItem::with_id("log", "Open log", has_log, None))?;
     m.append(&MenuItem::with_id("quit", "Quit", true, None))?;
     Ok(m)
 }
 
+/// Send everything podbeam prints (status, errors, panics) to `%LOCALAPPDATA%\podbeam\podbeam.log`.
+/// A log over 1 MB is moved to `podbeam.log.1` first, so the previous run survives one restart.
+fn log_to_file() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("podbeam");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("podbeam.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&path, dir.join("podbeam.log.1"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    // SAFETY: a valid handle that is never closed; std looks the std handles up on every write.
+    unsafe {
+        let handle = file.into_raw_handle();
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+    Some(path)
+}
+
 pub fn run(mut latency_ms: u32) -> Res<()> {
     unsafe { FreeConsole() }; // the tray needs no console window
+    let log_path = log_to_file();
+    log(format!("podbeam {} started", env!("CARGO_PKG_VERSION")));
     let (found_tx, found) = mpsc::channel();
     let search = move || {
         let tx = found_tx.clone();
@@ -155,6 +186,11 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
                 if let Some(addr) = session.as_ref().filter(|s| s.running()).map(|s| s.addr) {
                     session = restart(session.take(), addr, ms);
                 }
+            } else if id == "log" {
+                // Explorer opens the file with whatever the user has set for .log files.
+                if let Some(p) = &log_path {
+                    let _ = std::process::Command::new("explorer").arg(p).spawn();
+                }
             } else if id == "stop" || id == "quit" {
                 if let Some(s) = session.take() {
                     s.end();
@@ -178,7 +214,12 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
         let state = (status.clone(), running, current, latency_ms);
         if dirty || shown.as_ref() != Some(&state) {
             tray.set_menu(Some(Box::new(menu(
-                &devices, searching, current, latency_ms, &status,
+                &devices,
+                searching,
+                current,
+                latency_ms,
+                &status,
+                log_path.is_some(),
             )?)));
             tray.set_tooltip(Some(format!("podbeam: {status}")))?;
             tray.set_icon(Some(icon(running)))?;

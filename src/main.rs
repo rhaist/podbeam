@@ -28,7 +28,7 @@ mod tray;
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("error: {e}");
+        log(format!("error: {e}"));
         std::process::exit(1);
     }
 }
@@ -54,6 +54,36 @@ fn run() -> Res<()> {
     play(addr, latency_ms, &Arc::default())
 }
 
+/// Every message podbeam prints goes through here, with a UTC timestamp. On the command line that is
+/// the terminal; the Windows tray points stderr at its log file.
+fn log(msg: impl std::fmt::Display) {
+    eprintln!("{} {msg}", utc(SystemTime::now()));
+}
+
+/// `2026-11-09T13:53:07Z`, without pulling in a date crate.
+fn utc(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (
+        doy - (153 * mp + 2) / 5 + 1,
+        if mp < 10 { mp + 3 } else { mp - 9 },
+    );
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
 /// Shared between a streaming session and whoever started it (the command line or the tray).
 #[derive(Default)]
 struct Ctl {
@@ -64,7 +94,7 @@ struct Ctl {
 
 impl Ctl {
     fn say(&self, msg: String) {
-        println!("{msg}");
+        log(&msg);
         *self.status.lock().unwrap() = msg;
     }
 
@@ -93,7 +123,7 @@ fn discover() -> Res<Vec<(String, SocketAddr)>> {
     let rx = mdns.browse("_raop._tcp.local.")?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut found = Vec::new();
-    println!("searching for AirPlay devices...");
+    log("searching for AirPlay devices...");
     while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         let mdns_sd::ServiceEvent::ServiceResolved(s) = ev else {
             continue;
@@ -191,7 +221,7 @@ where
     // WASAPI flags a "discontinuity" whenever playback starts or stops; the gap is harmless here.
     let on_err = |e: cpal::Error| {
         if !e.to_string().contains("underrun or overrun") {
-            eprintln!("capture error: {e}")
+            log(format!("capture error: {e}"))
         }
     };
     Ok((dev.build_input_stream(cfg, on_data, on_err, None)?, rate))
@@ -578,7 +608,7 @@ fn serve_events(mut tcp: TcpStream, key: [u8; 64]) -> Res<()> {
         tcp.write_all(
             &out.seal(format!("RTSP/1.0 200 OK\r\n{cseq}Content-Length: 0\r\n\r\n").as_bytes()),
         )?;
-        eprintln!("event: {first}");
+        log(format!("event: {first}"));
     }
 }
 
@@ -1017,11 +1047,11 @@ fn stream_to(
                 if let Err(e) = serve_events(tcp, key)
                     && !c.stopped()
                 {
-                    eprintln!("event channel closed: {e}");
+                    log(format!("event channel closed: {e}"));
                 }
             });
         }
-        Err(e) => eprintln!("no event channel ({e}), continuing without"),
+        Err(e) => log(format!("no event channel ({e}), continuing without")),
     }
     let c = ctl.clone();
     std::thread::spawn(move || serve_timing(timing, c));
@@ -1300,6 +1330,15 @@ mod tests {
         set(&["set-sink-mute", "@DEFAULT_SINK@", "0"]);
         set(&["set-sink-volume", "@DEFAULT_SINK@", "100%"]);
         assert!((v.level().unwrap() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn utc_formats_known_instants() {
+        let at = |secs| utc(UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z"); // leap day in a century leap year
+        assert_eq!(at(1_794_232_387), "2026-11-09T13:53:07Z");
+        assert_eq!(at(4_102_444_799), "2099-12-31T23:59:59Z");
     }
 
     #[test]
