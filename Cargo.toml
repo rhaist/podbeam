@@ -3,12 +3,12 @@ name = "podbeam"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Stream Windows system audio to a HomePod over AirPlay 2, from the tray or the command line"
+description = "Stream your PC's audio to a HomePod over AirPlay 2 (Windows tray app, Linux with PulseAudio/PipeWire)"
 license = "MIT OR Apache-2.0"
 authors = ["Robert Haist <rhaist@mailbox.org>"]
 repository = "https://github.com/rhaist/podbeam"
 readme = "README.md"
-keywords = ["airplay", "homepod", "audio", "streaming", "windows"]
+keywords = ["airplay", "homepod", "audio", "windows", "linux"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
 [dependencies]
@@ -20,6 +20,9 @@ mdns-sd = "0.21"
 num-bigint = "0.5.1"
 plist = "1.10.3"
 sha2 = "0.11.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pulseaudio"] } # PulseAudio/PipeWire monitor capture
 
 [target."cfg(windows)".dependencies]
 tray-icon = { version = "0.26.1", default-features = false } # GTK backend is Linux-only and unused

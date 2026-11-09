@@ -1,6 +1,6 @@
-//! Stream Windows system audio to a HomePod over AirPlay 2 (HomeKit transient pairing, NTP timing).
+//! Stream system audio (Windows, or Linux with PulseAudio/PipeWire) to a HomePod over AirPlay 2.
 //! Usage: podbeam [name-filter | ip[:port]] [latency-ms, default 80]
-//! Without a target (or with "") it runs as a Windows tray icon with a device menu.
+//! On Windows, no target (or "") starts a tray icon with a device menu.
 
 use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -117,18 +117,48 @@ fn discover() -> Res<Vec<(String, SocketAddr)>> {
 
 /// The first device whose name contains `filter` (case-insensitive).
 fn find(filter: &str, devices: &[(String, SocketAddr)]) -> Res<SocketAddr> {
+    // An empty filter would match anything; only the Windows tray may run without a target.
     let hit = devices
         .iter()
-        .find(|(n, _)| n.to_lowercase().contains(&filter.to_lowercase()));
+        .find(|(n, _)| !filter.is_empty() && n.to_lowercase().contains(&filter.to_lowercase()));
     let names = devices
         .iter()
         .map(|(n, _)| n.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    hit.map(|d| d.1).ok_or_else(|| format!("no AirPlay device matching '{filter}' (found: {names}; same network? Windows network profile Private?)").into())
+    let found = if names.is_empty() {
+        "none; same network, multicast DNS allowed?".to_string()
+    } else {
+        names
+    };
+    hit.map(|d| d.1).ok_or_else(|| match filter {
+        "" => format!(
+            "name the AirPlay device to stream to, e.g. podbeam \"Living Room\" (found: {found})"
+        )
+        .into(),
+        _ => format!("no AirPlay device matching '{filter}' (found: {found})").into(),
+    })
+}
+
+/// Linux: record the monitor source of the default PulseAudio/PipeWire sink, i.e. whatever is playing.
+#[cfg(target_os = "linux")]
+fn capture(pcm: Pcm) -> Res<cpal::Stream> {
+    let host = cpal::host_from_id(cpal::HostId::PulseAudio)
+        .map_err(|e| format!("PulseAudio/PipeWire not reachable: {e}"))?;
+    let sink = host
+        .default_output_device()
+        .ok_or("no default PulseAudio sink")?;
+    let monitor = format!("{}.monitor", sink.id()?.id());
+    let dev = host
+        .input_devices()?
+        .find(|d| d.id().is_ok_and(|id| id.id() == monitor))
+        .ok_or(format!("no monitor source '{monitor}'"))?;
+    // The server converts to whatever format we ask for, so always take f32 at the source's rate.
+    loopback::<f32>(&dev, dev.default_input_config()?.config(), pcm)
 }
 
 /// WASAPI loopback: an input stream opened on the default *output* device captures what Windows plays.
+#[cfg(not(target_os = "linux"))]
 fn capture(pcm: Pcm) -> Res<cpal::Stream> {
     let dev = cpal::default_host()
         .default_output_device()
@@ -1025,6 +1055,35 @@ mod tests {
         }
     }
 
+    /// Needs a running PulseAudio/PipeWire server with something playing a 440 Hz tone, e.g.
+    /// `pactl load-module module-null-sink && sox -n -t pulseaudio default synth 5 sine 440`
+    /// then `cargo test -- --ignored pulse_monitor_capture`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn pulse_monitor_capture() {
+        let pcm = Pcm::default();
+        let stream = capture(pcm.clone()).unwrap();
+        stream.play().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        drop(stream);
+        let q: Vec<i16> = pcm.lock().unwrap().iter().copied().collect();
+        let left: Vec<i16> = q
+            .iter()
+            .step_by(2)
+            .copied()
+            .skip(RATE as usize / 4)
+            .collect(); // skip start-up
+        let seconds = left.len() as f64 / RATE as f64;
+        assert!(seconds > 1.0, "only {seconds:.2} s captured");
+        let crossings = left.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count() as f64;
+        let hz = crossings / seconds;
+        assert!(
+            (430.0..450.0).contains(&hz),
+            "captured {hz:.1} Hz, expected 440"
+        );
+    }
+
     #[test]
     fn find_by_name_part() {
         let d: Vec<(String, SocketAddr)> = ["Kitchen", "Living Room"]
@@ -1033,6 +1092,10 @@ mod tests {
             .map(|(n, i)| (n.to_string(), ([192, 0, 2, i], 7000).into()))
             .collect();
         assert_eq!(find("living", &d).unwrap(), d[1].1);
+        assert!(
+            find("", &d).is_err(),
+            "no target on the command line must not pick a random speaker"
+        );
         assert!(
             find("bedroom", &d)
                 .unwrap_err()

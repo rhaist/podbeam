@@ -1,17 +1,20 @@
 # podbeam
 
-Stream whatever your Windows PC plays to a HomePod, over AirPlay 2. podbeam runs as a
-tray icon: right-click, pick a speaker, done. It is a single small executable with no
+Stream whatever your PC plays to a HomePod, over AirPlay 2. On Windows podbeam runs as a
+tray icon: right-click, pick a speaker, done. On Linux it is a command-line tool that
+works with PulseAudio and PipeWire. Either way it is a single small executable with no
 installer and no background service.
 
 > podbeam is an independent project. It is not affiliated with, endorsed by or supported
 > by Apple. AirPlay and HomePod are trademarks of Apple Inc.
 
-Tested with a HomePod (2nd generation) on Windows 11.
+Tested with a HomePod (2nd generation) on Windows 11. Linux audio capture is tested
+against PulseAudio in CI; streaming from Linux to a real HomePod is not tested yet.
 
 ## Features
 
-- Captures all system audio (WASAPI loopback). No virtual audio driver needed.
+- Captures all system audio: WASAPI loopback on Windows, the monitor of the default
+  output on PulseAudio/PipeWire. No virtual audio driver needed.
 - Finds AirPlay receivers on the local network via mDNS.
 - Pairs with HomePods using HomeKit transient pairing, the password-less pairing a
   HomePod accepts from devices outside your Home. No PIN to type, nothing to install.
@@ -22,16 +25,22 @@ Tested with a HomePod (2nd generation) on Windows 11.
 
 ## Install
 
-Download `podbeam.exe` from the [latest release](https://github.com/rhaist/podbeam/releases/latest)
-and run it. Each release lists the file's SHA-256, so you can check the download:
+Download from the [latest release](https://github.com/rhaist/podbeam/releases/latest).
+Each file has a `.sha256` file next to it, so you can check the download.
 
-```powershell
-Get-FileHash .\podbeam.exe
+**Windows:** run `podbeam.exe`. Check it with `Get-FileHash .\podbeam.exe`. The
+executable is not code-signed, so Windows SmartScreen may warn on first start.
+
+**Linux (x86_64, glibc 2.35+):**
+
+```sh
+sha256sum -c podbeam-linux-x86_64.sha256
+chmod +x podbeam-linux-x86_64
+./podbeam-linux-x86_64 "Living Room"
 ```
 
-The executable is not code-signed, so Windows SmartScreen may warn on first start.
-
-Or build it yourself (Rust 1.90 or newer; on Windows also the Visual Studio C++ build tools):
+**Build it yourself** with Rust 1.90 or newer. On Windows you also need the Visual Studio
+C++ build tools; on Debian/Ubuntu `libasound2-dev` and `pkg-config`.
 
 ```
 cargo build --release
@@ -39,11 +48,11 @@ cargo build --release
 
 ## Usage
 
-**Tray:** start `podbeam.exe` without arguments. A grey dot appears in the notification
+**Tray (Windows):** start `podbeam.exe` without arguments. A grey dot appears in the notification
 area; right-click it to choose a speaker. The dot turns green while streaming. The menu
 also has the latency setting, Stop and Quit.
 
-**Command line:**
+**Command line (Windows and Linux):**
 
 ```
 podbeam "Living Room"         # first device whose name contains this text
@@ -62,19 +71,20 @@ handled automatically by growing the capture buffer.
 
 ## Requirements
 
-- Windows 10 or 11. The streaming code itself is portable, but the tray and the audio
-  capture are only tested on Windows.
+- Windows 10 or 11, or Linux with PulseAudio or PipeWire (with `pipewire-pulse`, the
+  default on current distributions). On Linux podbeam records the monitor of the
+  default output, so play audio on that output.
 - PC and speaker on the same network, with multicast DNS allowed. On Windows, set the
-  network profile to **Private**. Across VLANs, use an mDNS reflector or pass the
-  speaker's IP address directly.
+  network profile to **Private**; on Linux, allow UDP 5353 in your firewall. Across
+  VLANs, use an mDNS reflector or pass the speaker's IP address directly.
 - In the Home app, *Home Settings → Speakers & TV → Allow Speaker & TV Access* must be
   *Everyone* or *Anyone on the Same Network*. With *Only People Sharing This Home* the
   speaker may refuse to pair.
 
 ## How it works
 
-1. **Capture:** a WASAPI loopback stream on the default output device, resampled to
-   44.1 kHz stereo.
+1. **Capture:** a WASAPI loopback stream on the default output device (Windows) or the
+   default sink's monitor source (PulseAudio/PipeWire), resampled to 44.1 kHz stereo.
 2. **Pairing:** HomeKit transient pair-setup (SRP-6a, 3072-bit group, SHA-512, fixed PIN
    3939). The SRP session key is fed into HKDF-SHA-512 to derive the channel keys.
 3. **Session:** RTSP over the encrypted channel (ChaCha20-Poly1305), with binary-plist
@@ -95,6 +105,7 @@ handled automatically by growing the capture buffer.
 ## Limitations
 
 - One speaker at a time; no multi-room or stereo pairs.
+- No tray icon on Linux yet; use the command line.
 - No volume control yet; streams start at about a third of full volume.
 - Only AirPlay 2 receivers that support transient pairing (HomePods). AirPlay 1-only
   receivers are not supported.

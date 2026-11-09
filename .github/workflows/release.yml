@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build podbeam.exe and publish it as a GitHub release.
+# Push a tag like v0.1.0 to build podbeam for Windows and Linux and publish a GitHub release.
 on:
   push:
     tags: ["v*"]
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,6 +28,23 @@ jobs:
         run: |
           cd target/release
           sha256sum podbeam.exe > podbeam.exe.sha256
-          notes="SHA-256: \`$(cut -d' ' -f1 podbeam.exe.sha256)\`"
           gh release create "$GITHUB_REF_NAME" podbeam.exe podbeam.exe.sha256 \
-            --title "podbeam $GITHUB_REF_NAME" --notes "$notes" --generate-notes
+            --title "podbeam $GITHUB_REF_NAME" --generate-notes
+
+  linux:
+    needs: windows
+    # Oldest supported runner, so the binary runs on older glibc (Debian 12, Ubuntu 22.04 and newer).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: rustup update stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/podbeam podbeam-linux-x86_64
+          sha256sum podbeam-linux-x86_64 > podbeam-linux-x86_64.sha256
+          gh release upload "$GITHUB_REF_NAME" podbeam-linux-x86_64 podbeam-linux-x86_64.sha256
