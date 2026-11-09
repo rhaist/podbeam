@@ -177,9 +177,13 @@ pub fn run(latency_ms: u32) -> Res<()> {
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
             // Its last line is usually "<time> error: <why>"; a panic has no such prefix.
-            let log = std::fs::read_to_string(&path).unwrap_or_default();
-            let last = log.lines().last().unwrap_or("");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let last = text.lines().last().unwrap_or("");
             let why = last.split_once(" error: ").map_or(last, |(_, w)| w);
+            if why == ALREADY_RUNNING {
+                log(why); // not a failure: the tray the user wants is there
+                return Ok(());
+            }
             return Err(format!("the tray did not start: {why}").into());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -194,6 +198,17 @@ pub fn run(latency_ms: u32) -> Res<()> {
 /// `from_terminal`: report a missing tray at once. Started from a launcher or autostart, wait for
 /// it instead: at login podbeam can start before the panel's tray is up.
 fn run_tray(latency_ms: u32, from_terminal: bool) -> Res<()> {
+    // One tray per user, the freedesktop way (as GApplication and KDE apps do it): the session bus
+    // gives a well-known name to a single process and frees it when that process ends, crash or not.
+    let _instance = zbus::blocking::connection::Builder::session()?
+        .name(INSTANCE_ID)?
+        .replace_existing_names(false)
+        .allow_name_replacements(false)
+        .build()
+        .map_err(|e| match e {
+            zbus::Error::NameTaken => ALREADY_RUNNING.to_string(),
+            e => format!("D-Bus session bus: {e}"),
+        })?;
     log(format!("podbeam {} started", env!("CARGO_PKG_VERSION")));
     let tray = Tray {
         app: Some(App::new(latency_ms, log_path())),

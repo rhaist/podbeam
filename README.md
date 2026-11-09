@@ -43,10 +43,11 @@ the Visual Studio C++ build tools; Debian/Ubuntu needs `libasound2-dev` and `pkg
 
 **Tray:** start podbeam without arguments and right-click the grey dot in the tray to pick
 a speaker; it turns green while streaming. The menu also has the latency, Stop, **Open
-log** and Quit. On Linux, started from a terminal, the tray moves to the background. It
-shows in Cinnamon, KDE, XFCE and waybar (Hyprland, Sway); GNOME needs the AppIndicator
-extension. To start it at login, add `exec-once = podbeam` to the Hyprland config, or put
-a `.desktop` file with `Exec=podbeam` in `~/.config/autostart`.
+log** and Quit. Only one tray runs at a time; starting it again does nothing. On Linux,
+started from a terminal, the tray moves to the background. It shows in Cinnamon, KDE, XFCE
+and waybar (Hyprland, Sway); GNOME needs the AppIndicator extension. To start it at login,
+add `exec-once = podbeam` to the Hyprland config, or put a `.desktop` file with
+`Exec=podbeam` in `~/.config/autostart`.
 
 **Command line:**
 

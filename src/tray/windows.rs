@@ -4,9 +4,11 @@ use super::*;
 use std::os::windows::io::IntoRawHandle;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows_sys::Win32::System::Console::{
     FreeConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
 };
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, SetTimer, TranslateMessage,
 };
@@ -68,6 +70,14 @@ fn menu(v: &View) -> Res<Menu> {
     Ok(m)
 }
 
+/// One tray per user session: a named mutex, which Windows releases when the process ends.
+fn already_running() -> bool {
+    let name: Vec<u16> = format!("Local\\{INSTANCE_ID}\0").encode_utf16().collect();
+    // SAFETY: a NUL-terminated name; the handle is never closed, so the mutex lives until we exit.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    !handle.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS
+}
+
 fn action(id: &str) -> Option<Action> {
     Some(match id {
         "search" => Action::Search,
@@ -97,6 +107,10 @@ fn log_to_file() -> Option<PathBuf> {
 pub fn run(latency_ms: u32) -> Res<()> {
     unsafe { FreeConsole() }; // the tray needs no console window
     let log_path = log_to_file();
+    if already_running() {
+        log(ALREADY_RUNNING);
+        return Ok(());
+    }
     log(format!("podbeam {} started", env!("CARGO_PKG_VERSION")));
     let mut app = App::new(latency_ms, log_path);
     let tray = TrayIconBuilder::new()

@@ -16,7 +16,12 @@ pub use linux::run;
 #[cfg(windows)]
 pub use windows::run;
 
-const LATENCIES: [u32; 4] = LADDER_MS; // the buffer grows through these by itself too
+const LATENCIES: [u32; 4] = LADDER_MS;
+
+/// Identifies the tray to the system so that only one runs per user: a D-Bus name on Linux, a
+/// mutex name on Windows (reverse DNS of the project's home, as both conventions ask).
+const INSTANCE_ID: &str = "io.github.rhaist.podbeam";
+const ALREADY_RUNNING: &str = "podbeam is already running in the tray"; // the buffer grows through these by itself too
 
 /// A menu click.
 #[derive(Clone, Copy)]
