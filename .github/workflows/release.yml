@@ -1,0 +1,33 @@
+name: Release
+
+# Push a tag like v0.1.0 to build podbeam.exe and publish it as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup update stable
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml version $version"; exit 1; }
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd target/release
+          sha256sum podbeam.exe > podbeam.exe.sha256
+          notes="SHA-256: \`$(cut -d' ' -f1 podbeam.exe.sha256)\`"
+          gh release create "$GITHUB_REF_NAME" podbeam.exe podbeam.exe.sha256 \
+            --title "podbeam $GITHUB_REF_NAME" --notes "$notes" --generate-notes
