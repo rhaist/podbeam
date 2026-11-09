@@ -1,6 +1,6 @@
 //! Stream system audio (Windows, or Linux with PulseAudio/PipeWire) to a HomePod over AirPlay 2.
 //! Usage: podbeam [name-filter | ip[:port]] [latency-ms, default 80]
-//! On Windows, no target (or "") starts a tray icon with a device menu.
+//! On Windows and Linux, no target (or "") starts a tray icon with a device menu.
 
 use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -23,7 +23,7 @@ const RATE: u32 = 44100;
 const FRAMES: usize = 352; // frames per RTP packet ("spf")
 const HISTORY: usize = 512; // sent packets kept for retransmission (~4 s)
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod tray;
 
 fn main() {
@@ -42,7 +42,7 @@ fn run() -> Res<()> {
         .ok()
         .filter(|ms| (20..=2000).contains(ms))
         .ok_or("latency must be 20..2000 ms")?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if target.is_empty() {
         return tray::run(latency_ms);
     }
@@ -146,7 +146,7 @@ fn discover() -> Res<Vec<(String, SocketAddr)>> {
 
 /// The first device whose name contains `filter` (case-insensitive).
 fn find(filter: &str, devices: &[(String, SocketAddr)]) -> Res<SocketAddr> {
-    // An empty filter would match anything; only the Windows tray may run without a target.
+    // An empty filter would match anything; only the tray may run without a target.
     let hit = devices
         .iter()
         .find(|(n, _)| !filter.is_empty() && n.to_lowercase().contains(&filter.to_lowercase()));

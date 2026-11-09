@@ -1,9 +1,9 @@
 # podbeam
 
-Stream whatever your PC plays to a HomePod, over AirPlay 2. On Windows podbeam runs as a
-tray icon: right-click, pick a speaker, done. On Linux it is a command-line tool that
-works with PulseAudio and PipeWire. Either way it is a single small executable with no
-installer and no background service.
+Stream whatever your PC plays to a HomePod, over AirPlay 2. podbeam runs as a tray icon:
+right-click, pick a speaker, done. It works on Windows and on Linux with PulseAudio or
+PipeWire, and can also stream straight from the command line. Either way it is a single
+small executable with no installer and no background service.
 
 > podbeam is an independent project. It is not affiliated with, endorsed by or supported
 > by Apple. AirPlay and HomePod are trademarks of Apple Inc.
@@ -52,11 +52,20 @@ cargo build --release
 
 ## Usage
 
-**Tray (Windows):** start `podbeam.exe` without arguments. A grey dot appears in the notification
-area; right-click it to choose a speaker. The dot turns green while streaming. The menu
-also has the latency setting, Stop, Quit and **Open log**. The tray writes everything it
-reports, including errors, to `%LOCALAPPDATA%\podbeam\podbeam.log` (moved to
-`podbeam.log.1` once it passes 1 MB). Attach it when you report a problem.
+**Tray:** start podbeam without arguments. A grey dot appears in the notification area
+(on Linux: the panel's tray); right-click it to choose a speaker. The dot turns green
+while streaming. The menu also has the latency setting, Stop, Quit and **Open log**. The
+tray writes everything it reports, including errors, to a log file (moved to
+`podbeam.log.1` once it passes 1 MB). Attach it when you report a problem:
+
+- Windows: `%LOCALAPPDATA%\podbeam\podbeam.log`
+- Linux: `~/.local/state/podbeam/podbeam.log`
+
+On Linux, started from a terminal, podbeam moves the tray to the background and gives the
+terminal back. It works with Cinnamon, KDE, XFCE and waybar (Hyprland, Sway); GNOME needs
+the AppIndicator extension. To start it at login, add `exec-once = podbeam` to the Hyprland
+config, or on other desktops put a `.desktop` file with `Exec=podbeam` in
+`~/.config/autostart`.
 
 **Command line (Windows and Linux):**
 
@@ -116,7 +125,6 @@ handled automatically by growing the capture buffer.
 ## Limitations
 
 - One speaker at a time; no multi-room or stereo pairs.
-- No tray icon on Linux yet; use the command line.
 - The speaker follows the system volume, so your PC's own speakers change with it, and
   muting the PC mutes the speaker too. Where the system volume cannot be read, podbeam
   starts at about a third of full volume.
