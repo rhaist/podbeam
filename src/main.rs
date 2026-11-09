@@ -785,6 +785,94 @@ impl Cushion {
     }
 }
 
+/// AirPlay volume in dB for a volume-slider position (0..1): -30 is the quietest step, 0 is full
+/// volume and -144 means mute. Senders map their slider linearly onto -30..0, like iOS does.
+fn airplay_db(level: f32) -> f32 {
+    if level <= 0.0 {
+        -144.0
+    } else {
+        -30.0 + 30.0 * level.min(1.0)
+    }
+}
+
+/// The volume slider of the system's default output: 0 when muted, 1 at full volume.
+#[cfg(windows)]
+struct SystemVolume(windows::Win32::Media::Audio::IMMDeviceEnumerator);
+
+#[cfg(windows)]
+impl SystemVolume {
+    fn new() -> Option<Self> {
+        use windows::Win32::Media::Audio::MMDeviceEnumerator;
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        };
+        // SAFETY: plain COM setup on this thread; the enumerator stays on this thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .ok()
+                .map(Self)
+        }
+    }
+
+    fn level(&self) -> Option<f32> {
+        use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+        use windows::Win32::Media::Audio::{eConsole, eRender};
+        use windows::Win32::System::Com::CLSCTX_ALL;
+        // SAFETY: COM calls on the thread that created the enumerator. Asking for the default device
+        // every time follows the user switching outputs.
+        unsafe {
+            let vol: IAudioEndpointVolume = self
+                .0
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .ok()?
+                .Activate(CLSCTX_ALL, None)
+                .ok()?;
+            if vol.GetMute().ok()?.as_bool() {
+                Some(0.0)
+            } else {
+                vol.GetMasterVolumeLevelScalar().ok()
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SystemVolume(pulseaudio::Client);
+
+#[cfg(target_os = "linux")]
+impl SystemVolume {
+    fn new() -> Option<Self> {
+        pulseaudio::Client::from_env(c"podbeam").ok().map(Self)
+    }
+
+    fn level(&self) -> Option<f32> {
+        let sink =
+            futures::executor::block_on(self.0.sink_info_by_name(c"@DEFAULT_SINK@".into())).ok()?;
+        let loudest = sink.cvolume.channels().iter().map(|v| v.as_u32()).max()?;
+        // PulseAudio's 100 % (NORM) is the top of the slider; boosts above it count as full volume.
+        Some(if sink.muted {
+            0.0
+        } else {
+            loudest as f32 / pulseaudio::protocol::Volume::NORM.as_u32() as f32
+        })
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+struct SystemVolume;
+
+#[cfg(not(any(windows, target_os = "linux")))]
+impl SystemVolume {
+    fn new() -> Option<Self> {
+        None
+    }
+
+    fn level(&self) -> Option<f32> {
+        None
+    }
+}
+
 /// Ends a session whichever way stream_to returns: stops the helper threads, then sends TEARDOWN.
 struct EndSession {
     ctl: Arc<Ctl>,
@@ -906,24 +994,35 @@ fn stream_to(addr: SocketAddr, pcm: Pcm, latency: u32, ctl: &Arc<Ctl>) -> Res<()
     };
     let (audio_to, ctrl_to) = (port("dataPort")?, port("controlPort")?);
 
-    // AirPlay volume is -30 (min) .. 0 dB (max); start at roughly a third so nothing blasts.
-    r.ok(
-        "SET_PARAMETER",
-        "",
-        "",
-        Some(("text/parameters", b"volume: -20.000000\r\n")),
-    )?;
     ctl.say(format!(
         "streaming to {addr} with {} ms latency",
         latency * 1000 / RATE
     ));
 
-    // Keep-alive in its own thread so a slow reply never delays audio; the HomePod ends the session without it.
+    // Keep-alive and volume in their own thread so a slow reply never delays audio; the HomePod ends
+    // the session without the keep-alive.
     r.tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     let c = ctl.clone();
     end.rtsp = Some(std::thread::spawn(move || {
-        let mut last = Instant::now();
+        let (mut last, mut sent_db, system) = (Instant::now(), f32::NAN, SystemVolume::new());
         while !c.stopped() {
+            // Follow the system volume, so the keyboard's volume and mute keys work on the speaker.
+            let db = system
+                .as_ref()
+                .and_then(SystemVolume::level)
+                .map_or(-20.0, airplay_db);
+            if (db - sent_db).abs() >= 0.1 || sent_db.is_nan() {
+                let body = format!("volume: {db:.6}\r\n");
+                if let Err(e) = r.ok(
+                    "SET_PARAMETER",
+                    "",
+                    "",
+                    Some(("text/parameters", body.as_bytes())),
+                ) {
+                    return c.fail(format!("lost the HomePod ({e})"));
+                }
+                sent_db = db;
+            }
             std::thread::sleep(Duration::from_millis(100));
             if last.elapsed() >= Duration::from_secs(2) {
                 if let Err(e) = r.req("POST", "/feedback", "", None) {
@@ -1082,6 +1181,44 @@ mod tests {
             (430.0..450.0).contains(&hz),
             "captured {hz:.1} Hz, expected 440"
         );
+    }
+
+    #[test]
+    fn volume_maps_slider_to_airplay_db() {
+        assert_eq!(airplay_db(0.0), -144.0); // mute, not just quiet
+        assert_eq!(airplay_db(0.01), -29.7);
+        assert_eq!(airplay_db(0.5), -15.0);
+        assert_eq!(airplay_db(1.0), 0.0);
+        assert_eq!(airplay_db(1.5), 0.0); // PulseAudio boost above 100 %
+    }
+
+    /// Needs a running PulseAudio/PipeWire server; changes and restores the default sink's volume.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn pulse_system_volume() {
+        let set = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("pactl")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        let v = SystemVolume::new().expect("PulseAudio reachable");
+        set(&["set-sink-mute", "@DEFAULT_SINK@", "0"]);
+        set(&["set-sink-volume", "@DEFAULT_SINK@", "40%"]);
+        assert!(
+            (v.level().unwrap() - 0.4).abs() < 0.01,
+            "got {:?}",
+            v.level()
+        );
+        set(&["set-sink-mute", "@DEFAULT_SINK@", "1"]);
+        assert_eq!(v.level(), Some(0.0));
+        set(&["set-sink-mute", "@DEFAULT_SINK@", "0"]);
+        set(&["set-sink-volume", "@DEFAULT_SINK@", "100%"]);
+        assert!((v.level().unwrap() - 1.0).abs() < 0.01);
     }
 
     #[test]
