@@ -17,11 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
-type Pcm = Arc<Mutex<VecDeque<i16>>>; // interleaved stereo, 44.1 kHz
+type Pcm = Arc<Mutex<VecDeque<f32>>>; // interleaved stereo at the capture device's rate
 
 const RATE: u32 = 44100;
 const FRAMES: usize = 352; // frames per RTP packet ("spf")
-const MS: usize = RATE as usize * 2 / 1000; // interleaved samples per millisecond
 const HISTORY: usize = 512; // sent packets kept for retransmission (~4 s)
 
 #[cfg(windows)]
@@ -80,12 +79,12 @@ impl Ctl {
     }
 }
 
-/// Capture Windows audio and stream it to `addr` until `ctl.stop` is set or the connection fails.
+/// Capture system audio and stream it to `addr` until `ctl.stop` is set or the connection fails.
 fn play(addr: SocketAddr, latency_ms: u32, ctl: &Arc<Ctl>) -> Res<()> {
     let pcm = Pcm::default();
-    let stream = capture(pcm.clone())?;
+    let (stream, rate) = capture(pcm.clone())?;
     stream.play()?;
-    stream_to(addr, pcm, latency_ms * RATE / 1000, ctl)
+    stream_to(addr, pcm, rate, latency_ms * RATE / 1000, ctl)
 }
 
 /// Browse `_raop._tcp` for 3 s and return every receiver found, sorted by name.
@@ -142,7 +141,7 @@ fn find(filter: &str, devices: &[(String, SocketAddr)]) -> Res<SocketAddr> {
 
 /// Linux: record the monitor source of the default PulseAudio/PipeWire sink, i.e. whatever is playing.
 #[cfg(target_os = "linux")]
-fn capture(pcm: Pcm) -> Res<cpal::Stream> {
+fn capture(pcm: Pcm) -> Res<(cpal::Stream, u32)> {
     let host = cpal::host_from_id(cpal::HostId::PulseAudio)
         .map_err(|e| format!("PulseAudio/PipeWire not reachable: {e}"))?;
     let sink = host
@@ -159,7 +158,7 @@ fn capture(pcm: Pcm) -> Res<cpal::Stream> {
 
 /// WASAPI loopback: an input stream opened on the default *output* device captures what Windows plays.
 #[cfg(not(target_os = "linux"))]
-fn capture(pcm: Pcm) -> Res<cpal::Stream> {
+fn capture(pcm: Pcm) -> Res<(cpal::Stream, u32)> {
     let dev = cpal::default_host()
         .default_output_device()
         .ok_or("no default output device")?;
@@ -171,43 +170,22 @@ fn capture(pcm: Pcm) -> Res<cpal::Stream> {
     }
 }
 
+/// Open an input stream on `dev` that appends every frame as interleaved f32 stereo to `pcm`.
+/// Returns the stream and its sample rate; resampling to 44.1 kHz happens later, per packet.
 fn loopback<T: SizedSample>(
     dev: &cpal::Device,
     cfg: cpal::StreamConfig,
     pcm: Pcm,
-) -> Res<cpal::Stream>
+) -> Res<(cpal::Stream, u32)>
 where
     f32: cpal::FromSample<T>,
 {
-    let ch = cfg.channels as usize;
-    let step = cfg.sample_rate as f64 / RATE as f64;
-    let (mut prev, mut pos) = ([0f32; 2], 0f64); // resampler state carried across callbacks
-    // shortcut: linear-interpolation resampling (usually 48k -> 44.1k), fine on a speaker; use a sinc resampler (rubato) if you hear aliasing.
+    let (ch, rate) = (cfg.channels as usize, cfg.sample_rate);
+    // Mono is doubled; beyond stereo only front left/right are kept.
     let on_data = move |data: &[T], _: &cpal::InputCallbackInfo| {
-        let n = data.len() / ch;
-        // Frame i of this callback, with index 0 meaning the last frame of the previous one.
-        let frame = |i: usize| {
-            if i == 0 {
-                prev
-            } else {
-                [
-                    data[(i - 1) * ch].to_sample(),
-                    data[(i - 1) * ch + ch.min(2) - 1].to_sample(),
-                ]
-            }
-        };
         let mut q = pcm.lock().unwrap();
-        while pos < n as f64 {
-            let (i, t) = (pos as usize, pos.fract() as f32);
-            let (a, b) = (frame(i), frame(i + 1));
-            q.extend(
-                (0..2).map(|c| ((a[c] + (b[c] - a[c]) * t).clamp(-1.0, 1.0) * 32767.0) as i16),
-            );
-            pos += step;
-        }
-        pos -= n as f64;
-        if n > 0 {
-            prev = frame(n);
+        for f in data.chunks_exact(ch) {
+            q.extend([f[0].to_sample::<f32>(), f[ch.min(2) - 1].to_sample::<f32>()]);
         }
     };
     // WASAPI flags a "discontinuity" whenever playback starts or stops; the gap is harmless here.
@@ -216,7 +194,7 @@ where
             eprintln!("capture error: {e}")
         }
     };
-    Ok(dev.build_input_stream(cfg, on_data, on_err, None)?)
+    Ok((dev.build_input_stream(cfg, on_data, on_err, None)?, rate))
 }
 
 // ---------------------------------------------------------------- crypto
@@ -729,9 +707,10 @@ fn serve_resends(
     }
 }
 
-/// Our own jitter buffer between WASAPI capture and the network, sized automatically. The HomePod's
+/// Our own jitter buffer between capture and the network, sized automatically. The HomePod's
 /// latency is fixed for the session, but this part can change any time without the receiver noticing.
 struct Cushion {
+    per_ms: usize, // interleaved samples per millisecond at the capture rate
     ms: usize,     // fill level to reach before sending real audio again
     primed: bool,  // currently sending captured audio
     dry: u32,      // packets sent as silence since the queue ran dry
@@ -743,8 +722,9 @@ impl Cushion {
     const MIN_MS: usize = 10; // must hold at least one packet (8 ms)
     const MAX_MS: usize = 100;
 
-    fn new() -> Self {
+    fn new(capture_rate: u32) -> Self {
         Cushion {
+            per_ms: capture_rate as usize * 2 / 1000,
             ms: 15,
             primed: false,
             dry: u32::MAX,
@@ -753,20 +733,20 @@ impl Cushion {
         }
     }
 
-    /// One packet of audio, or None to send silence while the queue refills.
-    fn take(&mut self, q: &mut VecDeque<i16>) -> Option<Vec<i16>> {
-        // shortcut: capture and network clocks drift, so a backlog well above the target is dropped
-        // (an inaudible skip every few minutes); a drift-tracking resampler would avoid it.
-        if q.len() > (self.ms + 50) * MS {
-            let excess = q.len() - (self.ms + 10) * MS;
+    /// `frames` of captured audio for one packet, or None to send silence while the queue refills.
+    fn take(&mut self, q: &mut VecDeque<f32>, frames: usize) -> Option<Vec<f32>> {
+        // Safety net only: the Converter's drift correction holds the backlog near the target, so this
+        // fires only after a stall (the PC was suspended, the network thread was starved).
+        if q.len() > (self.ms + 50) * self.per_ms {
+            let excess = q.len() - (self.ms + 10) * self.per_ms;
             q.drain(..excess);
         }
-        if self.primed && q.len() < FRAMES * 2 {
+        if self.primed && q.len() < frames * 2 {
             (self.primed, self.dry) = (false, 0);
         }
         if !self.primed {
             self.dry = self.dry.saturating_add(1);
-            if q.len() < self.ms * MS {
+            if q.len() < (self.ms * self.per_ms).max(frames * 2) {
                 return None;
             }
             self.primed = true;
@@ -781,7 +761,89 @@ impl Cushion {
             // 30 s without a dropout: give back 1 ms.
             (self.ms, self.calm) = ((self.ms - 1).max(Self::MIN_MS), 0);
         }
-        Some(q.drain(..FRAMES * 2).collect())
+        Some(q.drain(..frames * 2).collect())
+    }
+}
+
+/// Turns captured audio at the device's rate into AirPlay's 44.1 kHz/16 bit. Band-limited sinc
+/// resampling, with the ratio nudged (at most ±1000 ppm, under 2 cents) to hold the capture backlog
+/// at its target: that absorbs the drift between the sound card's and the network's clocks without
+/// skips. Then TPDF dither, so quiet passages keep their detail instead of turning into distortion.
+struct Converter {
+    sinc: rubato::Async<f32>,
+    backlog_ms: f64, // smoothed
+    out: Vec<f32>,
+    noise: u64, // xorshift state for the dither
+}
+
+impl Converter {
+    fn new(capture_rate: u32) -> Res<Self> {
+        use rubato::{SincInterpolationParameters, SincInterpolationType, WindowFunction};
+        let params = SincInterpolationParameters::new(256, WindowFunction::BlackmanHarris2)
+            .oversampling_factor(256)
+            .interpolation(SincInterpolationType::Cubic);
+        let ratio = RATE as f64 / capture_rate as f64;
+        let sinc =
+            rubato::Async::new_sinc(ratio, 1.01, &params, FRAMES, 2, rubato::FixedAsync::Output)?;
+        Ok(Converter {
+            sinc,
+            backlog_ms: f64::NAN,
+            out: vec![0.0; FRAMES * 2],
+            noise: u64::from_be_bytes(random()) | 1,
+        })
+    }
+
+    /// Captured frames the next packet needs.
+    fn needed(&self) -> usize {
+        use rubato::Resampler;
+        self.sinc.input_frames_next()
+    }
+
+    /// Forget the filter history, after a gap in the audio.
+    fn reset(&mut self) {
+        use rubato::Resampler;
+        self.sinc.reset();
+    }
+
+    /// One packet from `input` (interleaved stereo, `needed()` frames), steering the capture backlog
+    /// (what is still queued after taking `input`) towards `target_ms`.
+    fn packet(&mut self, input: &[f32], backlog_ms: f64, target_ms: f64) -> Res<Vec<i16>> {
+        use rubato::audioadapter_buffers::direct::InterleavedSlice;
+        use rubato::{Adjustable, Resampler};
+        // Smooth over capture bursts (time constant ~0.4 s), then play up to 0.1 % faster or slower:
+        // a few ms of excess backlog drain at up to 1 ms per second.
+        self.backlog_ms = if self.backlog_ms.is_nan() {
+            backlog_ms
+        } else {
+            self.backlog_ms + 0.02 * (backlog_ms - self.backlog_ms)
+        };
+        let rel = 1.0 - (3e-4 * (self.backlog_ms - target_ms)).clamp(-1e-3, 1e-3);
+        self.sinc.set_resample_ratio_relative(rel, true)?;
+        let inp = InterleavedSlice::new(input, 2, input.len() / 2)?;
+        let mut out = InterleavedSlice::new_mut(&mut self.out, 2, FRAMES)?;
+        self.sinc.process_into_buffer(&inp, &mut out, None)?;
+        if self.out.iter().all(|&s| s == 0.0) {
+            return Ok(vec![0; FRAMES * 2]); // digital silence stays silent, no dither hiss
+        }
+        let mut pcm = Vec::with_capacity(FRAMES * 2);
+        for i in 0..FRAMES * 2 {
+            let x = self.out[i];
+            pcm.push(self.dither(x));
+        }
+        Ok(pcm)
+    }
+
+    /// Quantize to 16 bit with triangular (TPDF) dither: ±1 LSB of noise decorrelates the rounding
+    /// error from the signal, which keeps low-level detail and fades free of distortion.
+    fn dither(&mut self, x: f32) -> i16 {
+        let mut uniform = || {
+            self.noise ^= self.noise << 13;
+            self.noise ^= self.noise >> 7;
+            self.noise ^= self.noise << 17;
+            (self.noise >> 40) as f32 / (1u32 << 24) as f32
+        };
+        let tpdf = uniform() - uniform();
+        (x * 32767.0 + tpdf).round().clamp(-32768.0, 32767.0) as i16
     }
 }
 
@@ -893,7 +955,13 @@ impl Drop for EndSession {
 }
 
 /// `latency` is in samples: how far behind real time the HomePod plays.
-fn stream_to(addr: SocketAddr, pcm: Pcm, latency: u32, ctl: &Arc<Ctl>) -> Res<()> {
+fn stream_to(
+    addr: SocketAddr,
+    pcm: Pcm,
+    capture_rate: u32,
+    latency: u32,
+    ctl: &Arc<Ctl>,
+) -> Res<()> {
     let mut end = EndSession {
         ctl: ctl.clone(),
         events: None,
@@ -1055,7 +1123,8 @@ fn stream_to(addr: SocketAddr, pcm: Pcm, latency: u32, ctl: &Arc<Ctl>) -> Res<()
         u32::from_be_bytes(random()),
     );
     let start = Instant::now();
-    let (mut sent, mut last_stats, mut cushion) = (0u64, Instant::now(), Cushion::new());
+    let (mut sent, mut last_stats) = (0u64, Instant::now());
+    let (mut cushion, mut conv) = (Cushion::new(capture_rate), Converter::new(capture_rate)?);
     let mut shown_ms = cushion.ms;
     while !ctl.stopped() {
         let due = start + Duration::from_secs_f64(sent as f64 * FRAMES as f64 / RATE as f64);
@@ -1074,9 +1143,18 @@ fn stream_to(addr: SocketAddr, pcm: Pcm, latency: u32, ctl: &Arc<Ctl>) -> Res<()
             ctrl.send_to(&sync, ctrl_to)?;
         }
 
-        let samples = cushion
-            .take(&mut pcm.lock().unwrap())
-            .unwrap_or_else(|| vec![0; FRAMES * 2]);
+        let (input, backlog) = {
+            let mut q = pcm.lock().unwrap();
+            let input = cushion.take(&mut q, conv.needed());
+            (input, q.len() as f64 / cushion.per_ms as f64)
+        };
+        let samples = match input {
+            Some(input) => conv.packet(&input, backlog, cushion.ms as f64)?,
+            None => {
+                conv.reset();
+                vec![0; FRAMES * 2]
+            }
+        };
         let pkt = audio_packet(&aead, sent == 0, seq, rtp, ssrc, &alac(&samples));
         audio.send_to(&pkt, audio_to)?;
         history.lock().unwrap()[seq as usize % HISTORY] = pkt;
@@ -1162,20 +1240,23 @@ mod tests {
     #[ignore]
     fn pulse_monitor_capture() {
         let pcm = Pcm::default();
-        let stream = capture(pcm.clone()).unwrap();
+        let (stream, rate) = capture(pcm.clone()).unwrap();
         stream.play().unwrap();
         std::thread::sleep(Duration::from_secs(2));
         drop(stream);
-        let q: Vec<i16> = pcm.lock().unwrap().iter().copied().collect();
-        let left: Vec<i16> = q
+        let q: Vec<f32> = pcm.lock().unwrap().iter().copied().collect();
+        let left: Vec<f32> = q
             .iter()
             .step_by(2)
             .copied()
-            .skip(RATE as usize / 4)
+            .skip(rate as usize / 4)
             .collect(); // skip start-up
-        let seconds = left.len() as f64 / RATE as f64;
+        let seconds = left.len() as f64 / rate as f64;
         assert!(seconds > 1.0, "only {seconds:.2} s captured");
-        let crossings = left.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count() as f64;
+        let crossings = left
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count() as f64;
         let hz = crossings / seconds;
         assert!(
             (430.0..450.0).contains(&hz),
@@ -1242,6 +1323,112 @@ mod tests {
         assert!(find("x", &[]).is_err());
     }
 
+    const MS: usize = RATE as usize * 2 / 1000; // interleaved samples per millisecond at 44.1 kHz
+
+    /// Tones captured at 48 kHz must come out at 44.1 kHz at full level and clean: everything that is
+    /// not the tone (resampling artifacts, quantization) at least 85 dB below it, about what 16-bit
+    /// TPDF dither allows. The old linear interpolation managed 64 dB at 1 kHz, 22 dB at 10 kHz and
+    /// 13 dB at 15 kHz, and lost 1.3 and 2.9 dB of level at 10 and 15 kHz.
+    #[test]
+    fn converter_resamples_cleanly() {
+        for hz in [1000.0, 10_000.0, 15_000.0] {
+            let mut conv = Converter::new(48_000).unwrap();
+            let (mut t, mut out) = (0usize, Vec::new());
+            while out.len() < (RATE as usize + 4410) * 2 {
+                let n = conv.needed();
+                let input: Vec<f32> = (t..t + n)
+                    .flat_map(|i| {
+                        [(0.5 * (std::f64::consts::TAU * hz * i as f64 / 48_000.0).sin()) as f32; 2]
+                    })
+                    .collect();
+                t += n;
+                out.extend(conv.packet(&input, 15.0, 15.0).unwrap());
+            }
+            // Skip the filter's start-up, then analyse exactly one second of the left channel.
+            let y: Vec<f64> = out
+                .iter()
+                .step_by(2)
+                .skip(4410)
+                .take(RATE as usize)
+                .map(|&v| v as f64 / 32767.0)
+                .collect();
+            let (w, n) = (std::f64::consts::TAU * hz / RATE as f64, y.len() as f64);
+            let a = 2.0 / n
+                * y.iter()
+                    .enumerate()
+                    .map(|(i, v)| v * (w * i as f64).sin())
+                    .sum::<f64>();
+            let b = 2.0 / n
+                * y.iter()
+                    .enumerate()
+                    .map(|(i, v)| v * (w * i as f64).cos())
+                    .sum::<f64>();
+            let residual = y
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v - a * (w * i as f64).sin() - b * (w * i as f64).cos()).powi(2))
+                .sum::<f64>()
+                / n;
+            let snr_db = 10.0 * ((a * a + b * b) / 2.0 / residual).log10();
+            let level_db = 20.0 * (a.hypot(b) / 0.5).log10();
+            assert!(
+                level_db.abs() < 0.05,
+                "{hz} Hz: level off by {level_db:.2} dB"
+            );
+            assert!(
+                snr_db > 85.0,
+                "{hz} Hz: only {snr_db:.1} dB between tone and everything else"
+            );
+        }
+    }
+
+    /// The sound card runs 300 ppm fast and the backlog starts 10 ms too high: the drift correction
+    /// must pull it to the target and hold it there, without ever running dry.
+    #[test]
+    fn converter_tracks_clock_drift() {
+        let (rate, drift, per_ms, target) = (48_000.0, 1.0 + 300e-6, 96.0, 15.0);
+        let mut conv = Converter::new(48_000).unwrap();
+        let mut queued = (target + 10.0) * per_ms; // samples waiting, as a float to keep fractions
+        let mut worst = 0f64;
+        for packet in 0..7500 {
+            // 60 s: each packet is 352/44100 s of real time, in which the card delivers a little more.
+            queued += FRAMES as f64 / RATE as f64 * rate * drift * 2.0;
+            let n = conv.needed();
+            assert!(queued >= (n * 2) as f64, "ran dry at packet {packet}");
+            queued -= (n * 2) as f64;
+            conv.packet(&vec![0.0; n * 2], queued / per_ms, target)
+                .unwrap();
+            if packet > 5000 {
+                worst = worst.max((queued / per_ms - target).abs());
+            }
+        }
+        assert!(
+            worst < 2.0,
+            "backlog still up to {worst:.1} ms off target in the last 20 s"
+        );
+    }
+
+    #[test]
+    fn dither_keeps_detail_below_one_bit() {
+        let mut conv = Converter::new(RATE).unwrap();
+        // A quarter of one 16-bit step: plain rounding turns it into silence, dither keeps it on average.
+        let x = 0.25 / 32767.0;
+        let mean = (0..100_000).map(|_| conv.dither(x) as f64).sum::<f64>() / 100_000.0;
+        assert!((mean - 0.25).abs() < 0.02, "mean {mean}");
+        assert!(
+            (0..10_000).all(|_| conv.dither(0.0).abs() <= 1),
+            "dither is at most ±1 LSB"
+        );
+        // Digital silence must stay exactly silent rather than become dither noise.
+        let n = conv.needed();
+        assert!(
+            conv.packet(&vec![0.0; n * 2], 15.0, 15.0)
+                .unwrap()
+                .iter()
+                .all(|&s| s == 0)
+        );
+    }
+
     /// Capture arrives in 30 ms bursts while packets leave every 8 ms: the buffer must grow until the
     /// dropouts stop, ignore a real pause, and creep back down once the bursts stop.
     #[test]
@@ -1249,7 +1436,7 @@ mod tests {
         // Simulate `from..to` ms; returns the times (ms) of every dropout. Panics if audio was thrown away.
         fn run(
             c: &mut Cushion,
-            q: &mut VecDeque<i16>,
+            q: &mut VecDeque<f32>,
             from: usize,
             to: usize,
             burst_ms: usize,
@@ -1257,12 +1444,12 @@ mod tests {
             let (mut glitches, mut produced, mut consumed, queued) = (vec![], 0, 0, q.len());
             for t in from..to {
                 if burst_ms > 0 && t % burst_ms == 0 {
-                    q.extend(std::iter::repeat_n(1i16, burst_ms * MS));
+                    q.extend(std::iter::repeat_n(1.0f32, burst_ms * MS));
                     produced += burst_ms * MS;
                 }
                 if t % 8 == 0 {
                     let before = c.glitches;
-                    consumed += c.take(q).map_or(0, |s| s.len());
+                    consumed += c.take(q, FRAMES).map_or(0, |s| s.len());
                     if c.glitches > before {
                         glitches.push(t);
                     }
@@ -1275,7 +1462,7 @@ mod tests {
             );
             glitches
         }
-        let (mut c, mut q) = (Cushion::new(), VecDeque::new());
+        let (mut c, mut q) = (Cushion::new(RATE), VecDeque::new());
         let g = run(&mut c, &mut q, 0, 60_000, 30);
         assert!(
             !g.is_empty() && g.iter().all(|&t| t < 30_000),

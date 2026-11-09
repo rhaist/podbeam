@@ -19,6 +19,8 @@ against PulseAudio in CI; streaming from Linux to a real HomePod is not tested y
 - Pairs with HomePods using HomeKit transient pairing, the password-less pairing a
   HomePod accepts from devices outside your Home. No PIN to type, nothing to install.
 - Everything on the wire is encrypted: control channel, event channel and audio.
+- Transparent conversion: high-quality sinc resampling with clock-drift correction and
+  TPDF dither, measured at the 16-bit limit (87 dB) across the audio band.
 - Low latency: 80 ms speaker buffer by default (adjustable from 40 to 400 ms), plus a
   small capture buffer that sizes itself to your PC.
 - Resends lost packets when the speaker asks for them.
@@ -86,13 +88,18 @@ handled automatically by growing the capture buffer.
 ## How it works
 
 1. **Capture:** a WASAPI loopback stream on the default output device (Windows) or the
-   default sink's monitor source (PulseAudio/PipeWire), resampled to 44.1 kHz stereo.
-2. **Pairing:** HomeKit transient pair-setup (SRP-6a, 3072-bit group, SHA-512, fixed PIN
+   default sink's monitor source (PulseAudio/PipeWire).
+2. **Conversion:** a 256-tap sinc resampler brings the audio to AirPlay's 44.1 kHz. Its
+   ratio is nudged by at most ±0.1 % to absorb the drift between the sound card's clock
+   and the network clock, so there are no skips or dropouts. TPDF dither then reduces it
+   to 16 bit. Measured: everything that is not the signal sits 87 dB below it from 1 to
+   15 kHz, the limit of dithered 16-bit audio, with a flat frequency response.
+3. **Pairing:** HomeKit transient pair-setup (SRP-6a, 3072-bit group, SHA-512, fixed PIN
    3939). The SRP session key is fed into HKDF-SHA-512 to derive the channel keys.
-3. **Session:** RTSP over the encrypted channel (ChaCha20-Poly1305), with binary-plist
+4. **Session:** RTSP over the encrypted channel (ChaCha20-Poly1305), with binary-plist
    `SETUP` requests for the session and a realtime ALAC stream, NTP timing and a
    `/feedback` keep-alive.
-4. **Audio:** 352-frame ALAC packets over UDP/RTP, each encrypted with
+5. **Audio:** 352-frame ALAC packets over UDP/RTP, each encrypted with
    ChaCha20-Poly1305, plus sync packets once per second.
 
 ## Security notes
@@ -113,7 +120,8 @@ handled automatically by growing the capture buffer.
   starts at about a third of full volume.
 - Only AirPlay 2 receivers that support transient pairing (HomePods). AirPlay 1-only
   receivers are not supported.
-- Linear-interpolation resampling: fine for a speaker, not audiophile grade.
+- AirPlay carries 16-bit/44.1 kHz (CD quality) from third-party senders, and the HomePod
+  applies its own room correction and EQ, so the chain cannot be bit-perfect end to end.
 
 ## Credits
 
