@@ -176,8 +176,9 @@ impl App {
                 .take()
                 .map(Session::stop)
                 .or(app.stopping.take());
-            if app.speakers_off.is_none() {
-                app.speakers_off = VirtualSink::new(); // before the session picks its capture device
+            match &mut app.speakers_off {
+                Some(sink) => sink.set_latency(ms),
+                None => app.speakers_off = VirtualSink::new(ms), // before the session picks its capture device
             }
             app.session = Some(Session::start(addr, name, ms, previous));
         };

@@ -54,7 +54,7 @@ fn run() -> Res<()> {
         (_, Ok(ip)) => (ip, 7000).into(),
         _ => find(&target, &discover()?)?,
     };
-    let _speakers_off = VirtualSink::new();
+    let _speakers_off = VirtualSink::new(latency_ms);
     play(addr, latency_ms, &Arc::default())
 }
 
@@ -996,26 +996,41 @@ impl SystemVolume {
 }
 
 /// While it exists, apps play into a virtual "podbeam" output instead of the PC's speakers: only
-/// the HomePod plays, and the volume keys act on that output, which the HomePod follows. Needs
+/// the HomePod plays, the volume keys act on that output (the HomePod follows), and the output
+/// reports the HomePod's delay, so video players hold the picture back to stay in sync. Needs
 /// PipeWire (`pw-cli`, `wpctl`); elsewhere the PC's speakers keep playing too.
 #[cfg(target_os = "linux")]
 struct VirtualSink {
     pw: std::process::Child, // owns the output: it disappears when pw-cli exits
+    id: String,              // its PipeWire node id
     previous: std::ffi::CString, // the default output to restore
 }
 
 #[cfg(target_os = "linux")]
 impl VirtualSink {
-    fn new() -> Option<Self> {
-        Self::create()
+    /// Measured with a microphone: the speaker plays a sample this much later than the latency
+    /// setting (capture, cushion, the speaker's own processing). Approximate: the cushion adapts.
+    const EXTRA_MS: u32 = 45;
+
+    /// A combine-stream sink without outputs: unlike a null sink it can report a latency offset.
+    /// PipeWire before 0.3.63 lacks it and gets a null sink, still quiet, just without lip sync.
+    const OUTPUTS: [&str; 2] = [
+        "load-module libpipewire-module-combine-stream { combine.mode = sink node.name = podbeam \
+         node.description = \"podbeam (AirPlay)\" combine.props = { audio.position = [ FL FR ] } \
+         stream.rules = [ ] }",
+        "create-node adapter { factory.name = support.null-audio-sink node.name = podbeam \
+         node.description = \"podbeam (AirPlay)\" media.class = Audio/Sink audio.position = [ FL FR ] }",
+    ];
+
+    fn new(latency_ms: u32) -> Option<Self> {
+        Self::create(latency_ms)
             .inspect_err(|e| log(format!("the PC's speakers keep playing too ({e})")))
             .ok()
     }
 
-    fn create() -> Res<Self> {
+    fn create(latency_ms: u32) -> Res<Self> {
         use futures::executor::block_on as block;
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
+        use std::process::Command;
         let pulse = pulseaudio::Client::from_env(c"podbeam")?;
         let previous = block(pulse.server_info())?
             .default_sink_name
@@ -1033,54 +1048,71 @@ impl VirtualSink {
             .unwrap_or(0) as f32
             / pulseaudio::protocol::Volume::NORM.as_u32() as f32;
 
+        let mut made = None;
+        for line in Self::OUTPUTS {
+            let mut pw = Self::pw_cli()?;
+            writeln!(pw.stdin.as_mut().ok_or("pw-cli stdin")?, "{line}")?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut info = None;
+            while info.is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                info = block(pulse.sink_info_by_name(c"podbeam".into())).ok();
+            }
+            if let Some(info) = info {
+                made = Some((pw, info));
+                break;
+            }
+            let _ = pw.kill();
+            let _ = pw.wait();
+        }
+        let (pw, info) = made.ok_or("the virtual output did not appear")?;
+        let id = info
+            .props
+            .get_bytes(c"object.id")
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.trim_end_matches('\0').to_string())
+            .ok_or("the virtual output has no PipeWire id")?;
+        let mut sink = VirtualSink { pw, id, previous };
+        // A new output starts at full volume: carry the old one's over, or the HomePod starts loud.
+        let wpctl = |args: &[&str]| Command::new("wpctl").args(args).output();
+        wpctl(&["set-volume", &sink.id, &format!("{level:.3}")])?;
+        wpctl(&["set-mute", &sink.id, if old.muted { "1" } else { "0" }])?;
+        sink.set_latency(latency_ms);
+        block(pulse.set_default_sink(c"podbeam".into()))?;
+        Ok(sink)
+    }
+
+    /// pw-cli reading commands from us. If podbeam dies, even by SIGKILL, pw-cli is killed too and
+    /// takes the output with it.
+    fn pw_cli() -> Res<std::process::Child> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
         let mut pw = Command::new("pw-cli");
         pw.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // SAFETY: prctl is async-signal-safe. If podbeam dies, even by SIGKILL, pw-cli is killed
-        // and the output disappears with it. (The signal follows the spawning *thread*, which is
-        // the main thread on the command line and the tray's long-lived D-Bus thread.)
+        // SAFETY: prctl is async-signal-safe. The signal follows the spawning *thread*: the main
+        // thread on the command line, the tray's long-lived D-Bus thread in the tray.
         unsafe {
             pw.pre_exec(|| {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 Ok(())
             });
         }
-        let mut sink = VirtualSink {
-            pw: pw.spawn().map_err(|e| format!("pw-cli: {e}"))?,
-            previous,
-        };
-        writeln!(
-            sink.pw.stdin.as_mut().ok_or("pw-cli stdin")?,
-            "create-node adapter {{ factory.name=support.null-audio-sink node.name=podbeam \
-             node.description=\"podbeam (AirPlay)\" media.class=Audio/Sink audio.position=[FL FR] }}"
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while block(pulse.lookup_sink_by_name(c"podbeam".into())).is_err() {
-            if Instant::now() > deadline {
-                return Err("the virtual output did not appear".into()); // drop removes it
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        Ok(pw.spawn().map_err(|e| format!("pw-cli: {e}"))?)
+    }
+
+    /// Report the HomePod's delay to apps (what `pa_stream_get_latency` and PipeWire's stream
+    /// timing return), so players delay the picture by as much. A null sink ignores it.
+    fn set_latency(&mut self, latency_ms: u32) {
+        let ns = u64::from(latency_ms + Self::EXTRA_MS) * 1_000_000;
+        if let Some(stdin) = self.pw.stdin.as_mut() {
+            let _ = writeln!(
+                stdin,
+                "set-param {} Props {{ latencyOffsetNsec = {ns} }}",
+                self.id
+            );
         }
-        block(pulse.set_default_sink(c"podbeam".into()))?;
-        // A new output starts at full volume: carry the old one's over, or the HomePod starts loud.
-        // wpctl takes only ids, so wait until its default is ours before setting it.
-        let wpctl = |args: &[&str]| Command::new("wpctl").args(args).output();
-        while !String::from_utf8_lossy(&wpctl(&["inspect", "@DEFAULT_AUDIO_SINK@"])?.stdout)
-            .contains("node.name = \"podbeam\"")
-        {
-            if Instant::now() > deadline {
-                return Err("the virtual output did not become the default".into());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        wpctl(&["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{level:.3}")])?;
-        wpctl(&[
-            "set-mute",
-            "@DEFAULT_AUDIO_SINK@",
-            if old.muted { "1" } else { "0" },
-        ])?;
-        Ok(sink)
     }
 }
 
@@ -1101,9 +1133,11 @@ struct VirtualSink;
 
 #[cfg(not(target_os = "linux"))]
 impl VirtualSink {
-    fn new() -> Option<Self> {
+    fn new(_latency_ms: u32) -> Option<Self> {
         None
     }
+
+    fn set_latency(&mut self, _latency_ms: u32) {}
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
