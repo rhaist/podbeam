@@ -22,7 +22,7 @@ plist = "1.10.3"
 sha2 = "0.11.1"
 
 [target."cfg(windows)".dependencies]
-tray-icon = "0.26.1"
+tray-icon = { version = "0.26.1", default-features = false } # GTK backend is Linux-only and unused
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Foundation"] }
 
 [profile.release]
