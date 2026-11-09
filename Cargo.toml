@@ -1,0 +1,30 @@
+[package]
+name = "podbeam"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Stream Windows system audio to a HomePod over AirPlay 2, from the tray or the command line"
+license = "MIT OR Apache-2.0"
+authors = ["Robert Haist <rhaist@mailbox.org>"]
+repository = "https://github.com/rhaist/podbeam"
+readme = "README.md"
+keywords = ["airplay", "homepod", "audio", "streaming", "windows"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[dependencies]
+chacha20poly1305 = "0.11.0"
+cpal = "0.18"
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+mdns-sd = "0.21"
+num-bigint = "0.5.1"
+plist = "1.10.3"
+sha2 = "0.11.1"
+
+[target."cfg(windows)".dependencies]
+tray-icon = "0.26.1"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Foundation"] }
+
+[profile.release]
+lto = "thin"
+strip = true
