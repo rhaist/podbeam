@@ -18,6 +18,8 @@ pub enum Mode {
     WrongProof,
     /// Hangs up once streaming has started, like a HomePod that rebooted.
     HangUp,
+    /// Never answers TEARDOWN but keeps the connection open, like a HomePod that dropped off Wi-Fi.
+    IgnoreTeardown,
 }
 
 #[derive(Default)]
@@ -191,6 +193,10 @@ fn serve(mut tcp: TcpStream, mode: Mode, report: Arc<Mutex<Report>>) -> Res<()> 
         };
         log(&first);
         let method = first.split(' ').next().unwrap_or("");
+        if method == "TEARDOWN" && mode == Mode::IgnoreTeardown {
+            std::thread::sleep(Duration::from_secs(10));
+            return Ok(());
+        }
         let resp = match method {
             "SETUP" => {
                 let req = plist::from_bytes::<Value>(&body)?

@@ -23,10 +23,15 @@ struct Session {
 }
 
 impl Session {
-    fn start(addr: SocketAddr, latency_ms: u32) -> Self {
+    /// The new session first waits for `previous` (a stopping session's thread) to send its
+    /// TEARDOWN, so the HomePod never sees two sessions; waiting here keeps the menu responsive.
+    fn start(addr: SocketAddr, latency_ms: u32, previous: Option<JoinHandle<()>>) -> Self {
         let ctl = Arc::<Ctl>::default();
         let c = ctl.clone();
         let thread = std::thread::spawn(move || {
+            if let Some(p) = previous {
+                let _ = p.join();
+            }
             if let Err(e) = play(addr, latency_ms, &c) {
                 c.say(format!("error: {e}"));
             }
@@ -38,10 +43,12 @@ impl Session {
         !self.thread.is_finished()
     }
 
-    /// Stop and wait, so the HomePod gets its TEARDOWN before anything new starts.
-    fn end(self) {
+    /// Ask the session to end without waiting for it. The returned thread finishes once TEARDOWN
+    /// is sent (up to ~6 s if the HomePod stopped answering); join it before starting another
+    /// session or exiting.
+    fn stop(self) -> JoinHandle<()> {
         self.ctl.stop.store(true, Relaxed);
-        let _ = self.thread.join();
+        self.thread
     }
 }
 
@@ -150,6 +157,7 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
     search();
 
     let (mut devices, mut searching, mut session) = (Vec::new(), true, None::<Session>);
+    let mut stopping = None::<JoinHandle<()>>; // a stopped session still sending its TEARDOWN
     let tray = TrayIconBuilder::new()
         .with_tooltip("podbeam")
         .with_icon(icon(false))
@@ -168,11 +176,10 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
         }
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let id = ev.id.0.as_str();
-            let restart = |s: Option<Session>, addr: SocketAddr, ms| {
-                if let Some(s) = s {
-                    s.end();
-                }
-                Some(Session::start(addr, ms))
+            // At most one of the two is set: Stop moves the session to `stopping`, start takes it.
+            let mut restart = |s: Option<Session>, addr: SocketAddr, ms| {
+                let previous = s.map(Session::stop).or_else(|| stopping.take());
+                Some(Session::start(addr, ms, previous))
             };
             if let Some(i) = id
                 .strip_prefix("dev:")
@@ -191,13 +198,18 @@ pub fn run(mut latency_ms: u32) -> Res<()> {
                 if let Some(p) = &log_path {
                     let _ = std::process::Command::new("explorer").arg(p).spawn();
                 }
-            } else if id == "stop" || id == "quit" {
+            } else if id == "stop" {
                 if let Some(s) = session.take() {
-                    s.end();
+                    stopping = Some(s.stop());
                 }
-                if id == "quit" {
-                    return Ok(());
+            } else if id == "quit" {
+                // Hide the icon at once, then wait for TEARDOWN so the HomePod isn't left hanging.
+                drop(tray);
+                let threads = [session.take().map(Session::stop), stopping.take()];
+                for t in threads.into_iter().flatten() {
+                    let _ = t.join();
                 }
+                return Ok(());
             } else if id == "search" {
                 (searching, devices) = (true, Vec::new());
                 search();

@@ -1165,6 +1165,9 @@ fn stream_to(
                 last = Instant::now();
             }
         }
+        // A HomePod that went quiet must not hold up the stop for the full 5 s: the Windows tray
+        // waits for this before it starts the next session or exits.
+        let _ = r.tcp.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = r.req("TEARDOWN", "", "", None);
     }));
 
@@ -2007,6 +2010,26 @@ mod tests {
         );
         let e = run(Mode::HangUp);
         assert!(e.contains("lost the HomePod"), "hang-up reported as: {e}");
+    }
+
+    /// Stopping must not wait out the 5 s timeout for a TEARDOWN reply that never comes.
+    #[test]
+    fn stop_does_not_wait_for_a_silent_homepod() {
+        let (addr, _report) = fake_homepod::start(fake_homepod::Mode::IgnoreTeardown);
+        let (ctl, stop_at) = (Arc::<Ctl>::default(), Arc::new(Mutex::new(None)));
+        let (c, s) = (ctl.clone(), stop_at.clone());
+        std::thread::spawn(move || {
+            // Stop between keep-alives (every 2 s), so only the TEARDOWN is left to wait for.
+            while !c.status.lock().unwrap().starts_with("streaming") && !c.stopped() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            *s.lock().unwrap() = Some(Instant::now());
+            c.stop.store(true, Relaxed);
+        });
+        stream_to(addr, Pcm::default(), 48_000, 80 * RATE / 1000, &ctl).unwrap();
+        let took = stop_at.lock().unwrap().expect("never streamed").elapsed();
+        assert!(took < Duration::from_secs(3), "stop took {took:?}");
     }
 
     fn serve_once(bytes: Vec<u8>) -> TcpStream {
