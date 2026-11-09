@@ -54,7 +54,9 @@ cargo build --release
 
 **Tray (Windows):** start `podbeam.exe` without arguments. A grey dot appears in the notification
 area; right-click it to choose a speaker. The dot turns green while streaming. The menu
-also has the latency setting, Stop and Quit.
+also has the latency setting, Stop, Quit and **Open log**. The tray writes everything it
+reports, including errors, to `%LOCALAPPDATA%\podbeam\podbeam.log` (moved to
+`podbeam.log.1` once it passes 1 MB). Attach it when you report a problem.
 
 **Command line (Windows and Linux):**
 
