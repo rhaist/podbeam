@@ -39,3 +39,7 @@ strip = true
 # The resampler does real DSP work; keep it fast in debug builds and tests too.
 [profile.dev.package.rubato]
 opt-level = 3
+
+# Same for the 3072-bit SRP math: unoptimized, each pairing in a test takes about a second.
+[profile.dev.package.num-bigint]
+opt-level = 3

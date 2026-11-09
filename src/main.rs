@@ -1135,7 +1135,11 @@ fn stream_to(
 
     // Keep-alive and volume in their own thread so a slow reply never delays audio; the HomePod ends
     // the session without the keep-alive.
-    r.tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // On the socket the replies are read from: Windows does not carry the option over to a
+    // cloned socket, so setting it on `r.tcp` left reads there waiting until TCP gave up.
+    r.rd.get_ref()
+        .tcp
+        .set_read_timeout(Some(Duration::from_secs(5)))?;
     let c = ctl.clone();
     end.rtsp = Some(std::thread::spawn(move || {
         let (mut last, mut sent_db, system) = (Instant::now(), f32::NAN, SystemVolume::new());
@@ -1167,7 +1171,10 @@ fn stream_to(
         }
         // A HomePod that went quiet must not hold up the stop for the full 5 s: the Windows tray
         // waits for this before it starts the next session or exits.
-        let _ = r.tcp.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ =
+            r.rd.get_ref()
+                .tcp
+                .set_read_timeout(Some(Duration::from_secs(1)));
         let _ = r.req("TEARDOWN", "", "", None);
     }));
 
@@ -1792,6 +1799,7 @@ mod tests {
     /// Plays the server side of SRP-6a and checks both ends derive the same key and proofs.
     #[test]
     fn srp_matches_server_side() {
+        let _cpu = cpu_heavy(); // SRP math
         let (n, g) = srp_group();
         let salt: [u8; 16] = random();
         let x = BigUint::from_bytes_be(&sha512(&[&salt, &sha512(&[b"Pair-Setup:3939"])]));
@@ -1831,6 +1839,7 @@ mod tests {
     /// The hex values are test inputs and expected outputs, not keys of any real device or session.
     #[test]
     fn srp_matches_srptools() {
+        let _cpu = cpu_heavy(); // SRP math
         let h = |s: &str| {
             BigUint::parse_bytes(s.as_bytes(), 16)
                 .unwrap()
@@ -1993,6 +2002,7 @@ mod tests {
 
     #[test]
     fn end_to_end_error_paths() {
+        let _cpu = cpu_heavy(); // SRP math
         use fake_homepod::Mode;
         let run = |mode| {
             let (addr, _report) = fake_homepod::start(mode);
@@ -2019,6 +2029,7 @@ mod tests {
     /// Stopping must not wait out the 5 s timeout for a TEARDOWN reply that never comes.
     #[test]
     fn stop_does_not_wait_for_a_silent_homepod() {
+        let _cpu = cpu_heavy(); // SRP math
         let (addr, _report) = fake_homepod::start(fake_homepod::Mode::IgnoreTeardown);
         let (ctl, stop_at) = (Arc::<Ctl>::default(), Arc::new(Mutex::new(None)));
         let (c, s) = (ctl.clone(), stop_at.clone());
